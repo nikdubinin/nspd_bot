@@ -135,6 +135,144 @@ def _line_kv(label: str, value: object, *, code: bool = False) -> str | None:
     return f"• <b>{_esc(label)}:</b> {v}"
 
 
+def _classify_object(obj_type: str | None, category_name: str | None) -> tuple[str, str]:
+    """
+    Черновая классификация объекта для текстов инвесторам.
+
+    Возвращает (человекочитаемый тип, причастие 'расположенный/расположенная').
+    """
+    t = (obj_type or category_name or "").lower()
+
+    if "квартира" in t:
+        return "квартира", "расположенная"
+    if "комната" in t:
+        return "комната", "расположенная"
+    if "жил" in t and "дом" in t:
+        return "жилой дом", "расположенный"
+    if "здание" in t:
+        return "здание", "расположенное"
+    if "сооружение" in t:
+        return "сооружение", "расположенное"
+    if "зем" in t or t in {"зу", "з/у"}:
+        return "земельный участок", "расположенный"
+
+    return "объект недвижимости", "расположенный"
+
+
+def _build_investor_message(data: dict, *, kind: str) -> str:
+    """
+    Строит текст для инвесторов по данным НСПД.
+
+    kind: 'loan' (займ под залог) или 'buyout' (срочный выкуп).
+    """
+    kad = data.get("kad_number") or ""
+    obj_type = data.get("object_type") or data.get("type")
+
+    options: dict = {}
+    nspd_data = data.get("data")
+    category_name = ""
+    if isinstance(nspd_data, dict):
+        feats = nspd_data.get("features") or []
+        if feats:
+            props = feats[0].get("properties", {}) or {}
+            category_name = props.get("categoryName") or ""
+            options = props.get("options", {}) or {}
+
+    address = options.get("readable_address") or ""
+    area = options.get("build_record_area") or options.get("specified_area") or options.get("area")
+    purpose = options.get("purpose") or options.get("permitted_use_name")
+    status = options.get("status")
+    ownership_type = options.get("ownership_type")
+    floors = options.get("floors")
+    materials = options.get("materials")
+    year_built = options.get("year_built")
+    quarter_cad_number = options.get("quarter_cad_number")
+    cost_value = options.get("cost_value")
+
+    human_type, located_word = _classify_object(
+        obj_type=obj_type,
+        category_name=category_name,
+    )
+
+    lines: list[str] = []
+
+    # Приветствие и вводная
+    if kind == "loan":
+        lines.append("<b>Предложение по займу под залог</b>\n")
+    else:
+        lines.append("<b>Предложение на срочный выкуп</b>\n")
+
+    lines.append("Добрый день, уважаемые коллеги!\n")
+
+    main_line = (
+        f"Вашему вниманию к рассмотрению предлагается {html.escape(human_type)}, "
+        f"с кадастровым номером <code>{_esc(kad)}</code>, "
+    )
+    if address:
+        main_line += f"{_esc(located_word)} по адресу: {_esc(address)}."
+    else:
+        main_line = main_line.rstrip(", ") + "."
+    lines.append(main_line + "\n")
+
+    # Характеристики
+    lines.append("<b>Краткие характеристики объекта</b>")
+
+    char_lines: list[str] = []
+    if area not in (None, ""):
+        char_lines.append(f"• Площадь: {_esc(_fmt_number(area))} кв. м")
+    if purpose:
+        char_lines.append(f"• Назначение/вид использования: {_esc(purpose)}")
+    if status:
+        char_lines.append(f"• Статус по НСПД: {_esc(status)}")
+    if ownership_type:
+        char_lines.append(f"• Форма собственности: {_esc(ownership_type)}")
+    if floors:
+        char_lines.append(f"• Количество этажей: {_esc(floors)}")
+    if materials:
+        char_lines.append(f"• Материал стен/конструкций: {_esc(materials)}")
+    if year_built:
+        char_lines.append(f"• Год завершения строительства: {_esc(year_built)}")
+    if quarter_cad_number:
+        char_lines.append(
+            f"• Кадастровый квартал: <code>{_esc(quarter_cad_number)}</code>"
+        )
+    if cost_value not in (None, ""):
+        char_lines.append(
+            f"• Кадастровая стоимость (ориентир): {_esc(_fmt_number(cost_value))} руб."
+        )
+
+    if char_lines:
+        lines.extend(char_lines)
+    else:
+        lines.append("• Характеристики в открытом НСПД недоступны или не заполнены.")
+
+    # Блок условий / пожеланий
+    if kind == "loan":
+        lines.append("\n<b>Параметры предполагаемого займа</b>")
+        lines.append("• Требуемая сумма займа: __________________")
+        lines.append("• Срок займа: __________________")
+        lines.append("• Цель займа: __________________")
+
+        lines.append("\n<b>Информация о заемщике</b>")
+        lines.append("• Место работы / должность: __________________")
+        lines.append("• Ежемесячный совокупный доход: __________________")
+    else:
+        lines.append("\n<b>Параметры сделки по выкупу</b>")
+        lines.append("• Ожидаемая цена срочного выкупа: __________________")
+        lines.append("• Желаемый срок завершения сделки: __________________")
+
+    # Обременения и документы
+    lines.append("\n<b>Дополнительно</b>")
+    lines.append("• Наличие обременений: __________________")
+    lines.append(
+        "• Документы и фотографии предмета залога прилагаются к данному сообщению."
+    )
+
+    lines.append("\nЖдём ваших предложений и вопросов.")
+
+    return "\n".join(lines)
+
+
 async def _fetch_nspd_object(kad_number: str) -> dict:
     """
     Получение сведений об объекте из NSPD с кэшем и небольшим числом повторов.
@@ -278,7 +416,7 @@ def format_object_info(data: dict, *, short: bool = False) -> str:
         if obj_type or category_name:
             lines.append(f"<b>Тип:</b> {_esc(obj_type or category_name)}")
         if address:
-            lines.append(f"<b>Адрес:</b> {_esc(address)}")
+            lines.append(f"<b>Адрес:</b> <b>{_esc(address)}</b>")
         if area is not None and area != "":
             lines.append(f"<b>Площадь:</b> {_esc(_fmt_number(area))} кв. м")
         if purpose:
@@ -308,7 +446,7 @@ def format_object_info(data: dict, *, short: bool = False) -> str:
     if name:
         lines.append(f"<b>Наименование:</b> {_esc(name)}")
     if address:
-        lines.append(f"<b>Адрес:</b> {_esc(address)}")
+        lines.append(f"<b>Адрес:</b> <b>{_esc(address)}</b>")
     if geom_id:
         lines.append(f"<b>geom_id:</b> <code>{_esc(geom_id)}</code>")
     if updated_at or inserted_at:
@@ -539,7 +677,8 @@ async def kad_number_handler(
         view_mode = context.chat_data.get("view_mode", "full")
         formatted = format_object_info(data, short=(view_mode == "short"))
 
-        # Кнопки под сообщением: открыть в НСПД, показать связанные объекты, raw JSON.
+        # Кнопки под сообщением: открыть в НСПД, показать связанные объекты, raw JSON,
+        # а также сформировать текстовые предложения для инвесторов.
         buttons: list[list[InlineKeyboardButton]] = []
 
         # URL НСПД с подставленным кадастровым номером (простой вариант).
@@ -566,6 +705,24 @@ async def kad_number_handler(
                     InlineKeyboardButton(
                         "Показать raw JSON",
                         callback_data=f"raw:{kad_number}",
+                    )
+                ]
+            )
+
+            # Кнопки для генерации текстов-предложений
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "Сформировать предложение по займу под залог",
+                        callback_data=f"loan:{kad_number}",
+                    )
+                ]
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "Сформировать предложение на срочный выкуп",
+                        callback_data=f"buy:{kad_number}",
                     )
                 ]
             )
@@ -660,6 +817,37 @@ async def callback_query_handler(
             f"<b>Сырые данные НСПД для {html.escape(kad_number)}</b>\n"
             f"<pre>{raw_escaped}</pre>"
         )
+        await query.message.reply_text(text, parse_mode="HTML")
+
+        return
+
+    if data.startswith("loan:"):
+        kad_number = data[5:]
+        obj = await _fetch_nspd_object(kad_number)
+        if not obj or (isinstance(obj, dict) and obj.get("error")):
+            await query.message.reply_text(
+                "Не удалось сформировать предложение по займу под залог — "
+                "НСПД не вернула корректные данные по объекту.",
+                parse_mode="HTML",
+            )
+            return
+
+        text = _build_investor_message(obj, kind="loan")
+        await query.message.reply_text(text, parse_mode="HTML")
+        return
+
+    if data.startswith("buy:"):
+        kad_number = data[4:]
+        obj = await _fetch_nspd_object(kad_number)
+        if not obj or (isinstance(obj, dict) and obj.get("error")):
+            await query.message.reply_text(
+                "Не удалось сформировать предложение на срочный выкуп — "
+                "НСПД не вернула корректные данные по объекту.",
+                parse_mode="HTML",
+            )
+            return
+
+        text = _build_investor_message(obj, kind="buyout")
         await query.message.reply_text(text, parse_mode="HTML")
 
 
