@@ -1,17 +1,21 @@
-# bot.py
 import asyncio
+import html
+import json
 import logging
 import os
 import re
+import time
+from datetime import datetime
 from typing import Final
 
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
-    MessageHandler,
     ContextTypes,
+    MessageHandler,
     filters,
 )
 
@@ -48,8 +52,136 @@ if not TELEGRAM_BOT_TOKEN:
 nspd_api: Final = NSPD()
 
 # ------------------------------------------------------------------------------
+# Кэш ответов НСПД (минимизация задержек и нагрузки)
+# ------------------------------------------------------------------------------
+
+_CACHE_TTL_SECONDS: Final[int] = 30 * 60  # 30 минут
+_nspd_cache: dict[str, tuple[float, dict]] = {}
+
+# ------------------------------------------------------------------------------
 # Вспомогательные функции
 # ------------------------------------------------------------------------------
+
+def _esc(value: object) -> str:
+    """HTML-escape для безопасного вывода в Telegram (parse_mode=HTML)."""
+    if value is None:
+        return ""
+    return html.escape(str(value))
+
+
+def _truncate(text: object, max_len: int = 600) -> str:
+    if text is None:
+        return ""
+    if isinstance(text, (list, tuple, set)):
+        s = "; ".join(str(x) for x in text if x is not None)
+    else:
+        s = str(text)
+    s = s.strip()
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3].rstrip() + "..."
+
+
+def _fmt_date_iso(date_str: object) -> str:
+    """YYYY-MM-DD -> DD.MM.YYYY (если распознали)."""
+    if not date_str:
+        return ""
+    s = str(date_str).strip()
+    try:
+        dt = datetime.fromisoformat(s)
+        return dt.strftime("%d.%m.%Y")
+    except ValueError:
+        pass
+    try:
+        dt = datetime.strptime(s, "%Y-%m-%d")
+        return dt.strftime("%d.%m.%Y")
+    except ValueError:
+        return s
+
+
+def _fmt_dt_iso(dt_str: object) -> str:
+    """YYYY-MM-DDTHH:MM:SS -> DD.MM.YYYY HH:MM (если распознали)."""
+    if not dt_str:
+        return ""
+    s = str(dt_str).strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        return s
+
+
+def _fmt_number(value: object) -> str:
+    """Числа -> '1 234,56' (если возможно)."""
+    if value is None or value == "":
+        return ""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    # оставим до 2 знаков, уберём .00
+    s = f"{num:,.2f}".replace(",", " ").replace(".", ",")
+    if s.endswith(",00"):
+        s = s[:-3]
+    return s
+
+
+def _line_kv(label: str, value: object, *, code: bool = False) -> str | None:
+    if value is None or value == "":
+        return None
+    v = _esc(value)
+    if code:
+        v = f"<code>{v}</code>"
+    return f"• <b>{_esc(label)}:</b> {v}"
+
+
+async def _fetch_nspd_object(kad_number: str) -> dict:
+    """
+    Получение сведений об объекте из NSPD с кэшем и небольшим числом повторов.
+
+    Возвращает словарь, совместимый с NSPD-request get_object_info.
+    """
+    now = time.time()
+
+    # Кэш по кадастровому номеру
+    cached = _nspd_cache.get(kad_number)
+    if cached is not None:
+        ts, data = cached
+        if now - ts <= _CACHE_TTL_SECONDS:
+            logger.info("Используем кэш НСПД для %s", kad_number)
+            return data
+
+    last_data: dict | None = None
+
+    for attempt in range(3):
+        data: dict = await asyncio.to_thread(
+            nspd_api.get_object_info,
+            kad_number,
+            include_geom_id=True,
+            include_object_type=True,
+            include_related=True,
+        )
+        last_data = data
+
+        # Если нет ошибки — кэшируем и выходим
+        if not isinstance(data, dict) or not data.get("error"):
+            _nspd_cache[kad_number] = (now, data)
+            return data
+
+        # Ошибка — имеет ли смысл повторять?
+        err_text = str(data.get("error", "")).lower()
+        is_timeout = "timeout" in err_text or "time out" in err_text
+        is_connect = "connection" in err_text or "connect" in err_text
+
+        if attempt < 2 and (is_timeout or is_connect):
+            # Небольшая задержка перед повтором
+            await asyncio.sleep(2 * (attempt + 1))
+            continue
+
+        # Прочие ошибки/последняя попытка — выходим
+        break
+
+    return last_data or {}
 
 
 def normalize_kad_number(raw: str) -> str | None:
@@ -75,7 +207,7 @@ def normalize_kad_number(raw: str) -> str | None:
     return cleaned
 
 
-def format_object_info(data: dict) -> str:
+def format_object_info(data: dict, *, short: bool = False) -> str:
     """
     Форматирует ответ НСПД в человекочитаемое сообщение Telegram.
 
@@ -92,14 +224,19 @@ def format_object_info(data: dict) -> str:
     geom_id = data.get("geom_id")
 
     options: dict = {}
+    system_info: dict = {}
+    category_name = ""
     nspd_data = data.get("data")
     if isinstance(nspd_data, dict):
         features = nspd_data.get("features") or []
         if features:
             properties = features[0].get("properties", {}) or {}
+            system_info = properties.get("systemInfo", {}) or {}
+            category_name = properties.get("categoryName") or ""
             options = properties.get("options", {}) or {}
 
     # Поля характеристик объекта (для ЗУ/зданий и т.п.)
+    name = options.get("building_name") or options.get("name")
     address = options.get("readable_address")
     area = (
         options.get("build_record_area")
@@ -107,10 +244,12 @@ def format_object_info(data: dict) -> str:
         or options.get("area")
     )
     purpose = options.get("purpose") or options.get("permitted_use_name")
+    purpose_doc = options.get("permitted_use_established_by_document")
     status = options.get("status")
     ownership_type = options.get("ownership_type")
     floors = options.get("floors")
     underground_floors = options.get("underground_floors")
+    materials = options.get("materials")
     year_built = options.get("year_built")
     year_commissioning = options.get("year_commisioning")
 
@@ -123,71 +262,144 @@ def format_object_info(data: dict) -> str:
     # Прочие идентификаторы
     quarter_cad_number = options.get("quarter_cad_number")
     facility_cad_number = options.get("facility_cad_number")
+    united_cad_numbers = options.get("united_cad_numbers")
+    intersected_cad_numbers = options.get("intersected_cad_numbers")
+
+    inserted_at = system_info.get("inserted")
+    updated_at = system_info.get("updated")
+
+    # ------------------------------------------------------------------
+    # Краткий формат (для режима /short)
+    # ------------------------------------------------------------------
+    if short:
+        lines: list[str] = ["<b>Краткие сведения об объекте</b>"]
+        if kad:
+            lines.append(f"<b>Кадастровый номер:</b> <code>{_esc(kad)}</code>")
+        if obj_type or category_name:
+            lines.append(f"<b>Тип:</b> {_esc(obj_type or category_name)}")
+        if address:
+            lines.append(f"<b>Адрес:</b> {_esc(address)}")
+        if area is not None and area != "":
+            lines.append(f"<b>Площадь:</b> {_esc(_fmt_number(area))} кв. м")
+        if purpose:
+            lines.append(f"<b>Назначение:</b> {_esc(purpose)}")
+        if cost_value is not None:
+            lines.append(
+                f"<b>Кадастровая стоимость:</b> {_esc(_fmt_number(cost_value))} руб."
+            )
+        if updated_at or inserted_at:
+            when = _fmt_dt_iso(updated_at or inserted_at)
+            lines.append(f"<b>Актуализация в НСПД:</b> {_esc(when)}")
+        lines.append(
+            "\n<i>Отправьте команду /full, чтобы увидеть расширенные сведения.</i>"
+        )
+        return "\n".join(lines)
 
     lines: list[str] = []
 
-    lines.append("Информация по объекту:\n")
-
+    # ------------------------------------------------------------------
+    # Заголовок
+    # ------------------------------------------------------------------
+    lines.append("<b>Сведения об объекте</b>")
     if kad:
-        lines.append(f"• Кадастровый номер: <code>{kad}</code>")
-    if obj_type:
-        lines.append(f"• Тип объекта: {obj_type}")
+        lines.append(f"<b>Кадастровый номер:</b> <code>{_esc(kad)}</code>")
+    if obj_type or category_name:
+        lines.append(f"<b>Тип:</b> {_esc(obj_type or category_name)}")
+    if name:
+        lines.append(f"<b>Наименование:</b> {_esc(name)}")
+    if address:
+        lines.append(f"<b>Адрес:</b> {_esc(address)}")
     if geom_id:
-        lines.append(f"• Идентификатор геометрии (geom_id): <code>{geom_id}</code>")
+        lines.append(f"<b>geom_id:</b> <code>{_esc(geom_id)}</code>")
+    if updated_at or inserted_at:
+        when = _fmt_dt_iso(updated_at or inserted_at)
+        lines.append(f"<b>Актуализация в НСПД:</b> {_esc(when)}")
+
+    related = data.get("related") or []
+    if related:
+        lines.append("\n<b>Связанные объекты</b>")
+        if isinstance(related, list):
+            shown = related[:10]
+            for cad_rel in shown:
+                lines.append(f"• <code>{_esc(cad_rel)}</code>")
+            if len(related) > len(shown):
+                lines.append(f"• ...и ещё {len(related) - len(shown)}")
+        else:
+            lines.append(f"• {_esc(_truncate(related, 500))}")
 
     # ------------------------------------------------------------------
     # Характеристики объекта
     # ------------------------------------------------------------------
-    lines.append("\nХарактеристики объекта:")
-    if address:
-        lines.append(f"• Адрес: {address}")
-    if area is not None:
-        lines.append(f"• Площадь: {area} кв. м")
-    if purpose:
-        lines.append(f"• Назначение: {purpose}")
-    if status:
-        lines.append(f"• Статус: {status}")
-    if ownership_type:
-        lines.append(f"• Форма собственности: {ownership_type}")
-    if floors:
-        lines.append(f"• Количество этажей: {floors}")
-    if underground_floors:
-        lines.append(f"• Количество подземных этажей: {underground_floors}")
-    if year_built:
-        lines.append(f"• Год завершения строительства: {year_built}")
-    if year_commissioning:
-        lines.append(f"• Год ввода в эксплуатацию: {year_commissioning}")
+    lines.append("\n<b>Характеристики</b>")
 
-    if quarter_cad_number or facility_cad_number:
-        lines.append("\nРанее присвоенные/связанные номера:")
-        if quarter_cad_number:
-            lines.append(f"• Кадастровый квартал: <code>{quarter_cad_number}</code>")
-        if facility_cad_number:
-            lines.append(
-                f"• Условный номер / связанный объект: <code>{facility_cad_number}</code>"
-            )
+    kv_lines: list[str] = []
+    if area is not None and area != "":
+        kv_lines.append(f"• <b>Площадь:</b> {_esc(_fmt_number(area))} кв. м")
+    if purpose:
+        kv_lines.append(f"• <b>Назначение:</b> {_esc(purpose)}")
+    if status:
+        kv_lines.append(f"• <b>Статус:</b> {_esc(status)}")
+    if ownership_type:
+        kv_lines.append(f"• <b>Форма собственности:</b> {_esc(ownership_type)}")
+    if floors:
+        kv_lines.append(f"• <b>Этажей:</b> {_esc(floors)}")
+    if underground_floors:
+        kv_lines.append(f"• <b>Подземных этажей:</b> {_esc(underground_floors)}")
+    if materials:
+        kv_lines.append(f"• <b>Материал стен:</b> {_esc(materials)}")
+    if year_built:
+        kv_lines.append(f"• <b>Год завершения строительства:</b> {_esc(year_built)}")
+    if year_commissioning:
+        kv_lines.append(f"• <b>Год ввода в эксплуатацию:</b> {_esc(year_commissioning)}")
+    if quarter_cad_number:
+        kv_lines.append(f"• <b>Кадастровый квартал:</b> <code>{_esc(quarter_cad_number)}</code>")
+    if facility_cad_number:
+        kv_lines.append(
+            f"• <b>Условный/связанный номер:</b> <code>{_esc(facility_cad_number)}</code>"
+        )
+    if kv_lines:
+        lines.extend(kv_lines)
+    else:
+        lines.append("• (нет дополнительных характеристик в открытых данных НСПД)")
+
+    if purpose_doc:
+        lines.append("\n<b>Разрешённое использование (по документу)</b>")
+        lines.append(f"• {_esc(_truncate(purpose_doc, 800))}")
+
+    if united_cad_numbers:
+        lines.append("\n<b>Единые/объединённые номера</b>")
+        lines.append(f"• {_esc(_truncate(united_cad_numbers, 500))}")
+    if intersected_cad_numbers:
+        lines.append("\n<b>Пересечения</b>")
+        lines.append(f"• {_esc(_truncate(intersected_cad_numbers, 500))}")
 
     # ------------------------------------------------------------------
     # Сведения о кадастровой стоимости
     # ------------------------------------------------------------------
     if cost_value is not None:
-        lines.append("\nСведения о кадастровой стоимости:")
-        lines.append(f"• Кадастровая стоимость: {cost_value} руб.")
+        lines.append("\n<b>Кадастровая стоимость</b>")
+        lines.append(f"• <b>Стоимость:</b> {_esc(_fmt_number(cost_value))} руб.")
         if cost_index is not None:
-            lines.append(f"• Удельный показатель: {cost_index} руб./кв. м")
+            lines.append(
+                f"• <b>Удельный показатель:</b> {_esc(_fmt_number(cost_index))} руб./кв. м"
+            )
         if cost_determination_date:
-            lines.append(f"• Дата определения стоимости: {cost_determination_date}")
+            lines.append(
+                f"• <b>Дата определения:</b> {_esc(_fmt_date_iso(cost_determination_date))}"
+            )
         if cost_registration_date:
-            lines.append(f"• Дата внесения стоимости: {cost_registration_date}")
+            lines.append(
+                f"• <b>Дата внесения:</b> {_esc(_fmt_date_iso(cost_registration_date))}"
+            )
 
     # ------------------------------------------------------------------
     # Права и обременения
     # ------------------------------------------------------------------
-    lines.append("\nПрава и обременения:")
+    lines.append("\n<b>Права и обременения</b>")
     lines.append(
-        "• Открытый сервис НСПД (через библиотеку NSPD-request) не "
-        "предоставляет детализированные сведения о зарегистрированных правах "
-        "и обременениях. Для получения таких данных требуется выписка ЕГРН."
+        "• Открытый НСПД-геопортал (и библиотека NSPD-request) не отдают "
+        "детализированные сведения о зарегистрированных правах и обременениях.\n"
+        "• Для официальных данных по правам/ограничениям нужна выписка ЕГРН."
     )
 
     return "\n".join(lines)
@@ -222,16 +434,49 @@ async def help_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     Краткая инструкция по использованию бота.
     """
     text = (
-        "Инструкция по использованию бота:\n\n"
-        "1. Отправьте мне кадастровый номер объекта недвижимости.\n"
-        "2. Я обращусь к НСПД и верну доступные сведения об объекте.\n\n"
-        "Примеры допустимых форматов:\n"
-        "• 77:03:0002007:7190\n"
-        "• 77030002007 7190\n"
-        "• 77 03 0002007 7190\n\n"
-        "Если номер будет некорректен, я вежливо попрошу вас его уточнить."
+        "<b>Как пользоваться ботом</b>\n\n"
+        "Отправьте мне кадастровый номер, а я запрошу данные в НСПД и пришлю ответ.\n\n"
+        "<b>Примеры ввода</b>\n"
+        "• <code>77:03:0002007:7190</code>\n"
+        "• <code>77030002007 7190</code>\n"
+        "• <code>77 03 0002007 7190</code>\n\n"
+        "<b>Команды</b>\n"
+        "• /start — начать\n"
+        "• /help — справка\n"
+        "• /short — краткий формат ответа\n"
+        "• /full — подробный формат ответа\n\n"
+        "<b>Кнопки под ответом</b>\n"
+        "• <i>Открыть в НСПД</i> — откроет объект на карте НСПД\n"
+        "• <i>Показать связанные объекты</i> — список связанных кадастровых номеров (если есть)\n"
+        "• <i>Показать raw JSON</i> — сырые данные НСПД (для отладки)\n\n"
+        "<b>Важно</b>\n"
+        "Открытый НСПД-геопортал не отдаёт детализированные сведения о зарегистрированных "
+        "правах и обременениях. Для официальных данных нужна выписка ЕГРН."
     )
-    await update.effective_message.reply_text(text)
+    await update.effective_message.reply_text(text, parse_mode="HTML")
+
+
+async def set_mode_short_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Включает краткий формат вывода сведений."""
+    context.chat_data["view_mode"] = "short"
+    await update.effective_message.reply_text(
+        "Теперь бот будет показывать <b>краткие</b> сведения об объекте.\n"
+        "Чтобы вернуть подробный формат, используйте команду /full.",
+        parse_mode="HTML",
+    )
+
+
+async def set_mode_full_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Включает подробный формат вывода сведений."""
+    context.chat_data["view_mode"] = "full"
+    await update.effective_message.reply_text(
+        "Теперь бот будет показывать <b>подробные</b> сведения об объекте.",
+        parse_mode="HTML",
+    )
 
 
 async def kad_number_handler(
@@ -264,20 +509,16 @@ async def kad_number_handler(
         )
         return
 
-    await message.reply_text(
-        f"Принял кадастровый номер: <code>{kad_number}</code>\n"
-        "Запрашиваю данные в Национальной системе пространственных данных...",
-        parse_mode="HTML",
-    )
-
     try:
-        # Универсальная функция возвращает словарь с данными объекта.[web:12]
-        # В актуальной версии nspd-request метод называется get_object_info.
-        data: dict = nspd_api.get_object_info(
-            kad_number,
-            include_geom_id=True,
-            include_object_type=True,
+        await message.reply_text(
+            f"Принял кадастровый номер: <code>{kad_number}</code>\n"
+            "Запрашиваю данные в Национальной системе пространственных данных...",
+            parse_mode="HTML",
         )
+
+        # Универсальная функция возвращает словарь с данными объекта.[web:12]
+        # Получаем данные через обёртку с кэшем и повторами.
+        data: dict = await _fetch_nspd_object(kad_number)
 
         if not data:
             await message.reply_text(
@@ -295,8 +536,42 @@ async def kad_number_handler(
             )
             return
 
-        formatted = format_object_info(data)
-        await message.reply_text(formatted, parse_mode="HTML")
+        view_mode = context.chat_data.get("view_mode", "full")
+        formatted = format_object_info(data, short=(view_mode == "short"))
+
+        # Кнопки под сообщением: открыть в НСПД, показать связанные объекты, raw JSON.
+        buttons: list[list[InlineKeyboardButton]] = []
+
+        # URL НСПД с подставленным кадастровым номером (простой вариант).
+        if kad_number:
+            nspd_url = (
+                "https://nspd.gov.ru/map?thematic=PKK"
+                f"&query={kad_number}"
+            )
+            buttons.append(
+                [InlineKeyboardButton("Открыть в НСПД", url=nspd_url)]
+            )
+
+        if kad_number:
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "Показать связанные объекты",
+                        callback_data=f"rel:{kad_number}",
+                    )
+                ]
+            )
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        "Показать raw JSON",
+                        callback_data=f"raw:{kad_number}",
+                    )
+                ]
+            )
+
+        reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
+        await message.reply_text(formatted, parse_mode="HTML", reply_markup=reply_markup)
 
     except Exception as exc:
         logger.exception("Ошибка при обращении к НСПД: %s", exc)
@@ -315,6 +590,79 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
     logger.error("Произошла ошибка при обработке обновления: %s", context.error)
 
 
+async def callback_query_handler(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Обрабатывает нажатия на inline-кнопки под сообщением бота."""
+    query = update.callback_query
+    if not query:
+        return
+
+    data = query.data or ""
+    await query.answer()
+
+    if data.startswith("rel:"):
+        kad_number = data[4:]
+        obj = await _fetch_nspd_object(kad_number)
+        if not obj or (isinstance(obj, dict) and obj.get("error")):
+            await query.message.reply_text(
+                "Не удалось получить сведения о связанных объектах.\n"
+                "Попробуйте ещё раз позднее.",
+                parse_mode="HTML",
+            )
+            return
+
+        related = obj.get("related") or []
+        if not related:
+            await query.message.reply_text(
+                "Связанные объекты не найдены в открытых данных НСПД.",
+                parse_mode="HTML",
+            )
+            return
+
+        text_lines = [
+            f"<b>Связанные объекты для {html.escape(kad_number)}</b>",
+        ]
+        if isinstance(related, list):
+            shown = related[:50]
+            for cad_rel in shown:
+                text_lines.append(f"• <code>{_esc(cad_rel)}</code>")
+            if len(related) > len(shown):
+                text_lines.append(
+                    f"• ...и ещё {len(related) - len(shown)} (не показаны для краткости)"
+                )
+        else:
+            text_lines.append(f"• {_esc(_truncate(related, 1500))}")
+
+        await query.message.reply_text(
+            "\n".join(text_lines),
+            parse_mode="HTML",
+        )
+        return
+
+    if data.startswith("raw:"):
+        kad_number = data[4:]
+        obj = await _fetch_nspd_object(kad_number)
+        if not obj or (isinstance(obj, dict) and obj.get("error")):
+            await query.message.reply_text(
+                "Не удалось получить сырые данные НСПД для этого объекта.",
+                parse_mode="HTML",
+            )
+            return
+
+        try:
+            raw = json.dumps(obj, ensure_ascii=False, indent=2)
+        except TypeError:
+            raw = str(obj)
+
+        raw_escaped = html.escape(_truncate(raw, 3500))
+        text = (
+            f"<b>Сырые данные НСПД для {html.escape(kad_number)}</b>\n"
+            f"<pre>{raw_escaped}</pre>"
+        )
+        await query.message.reply_text(text, parse_mode="HTML")
+
+
 # ------------------------------------------------------------------------------
 # Точка входа
 # ------------------------------------------------------------------------------
@@ -331,11 +679,16 @@ def main() -> None:
     # Команды
     application.add_handler(CommandHandler("start", start_handler))
     application.add_handler(CommandHandler("help", help_handler))
+    application.add_handler(CommandHandler("short", set_mode_short_handler))
+    application.add_handler(CommandHandler("full", set_mode_full_handler))
 
     # Любой текст, не начинающийся с /, считаем попыткой ввести кадастровый номер
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, kad_number_handler)
     )
+
+    # Колбэки от inline-кнопок
+    application.add_handler(CallbackQueryHandler(callback_query_handler))
 
     # Глобальный обработчик ошибок
     application.add_error_handler(error_handler)
