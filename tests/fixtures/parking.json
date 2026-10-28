@@ -1,0 +1,55 @@
+{
+ "data": {
+  "type": "FeatureCollection",
+  "features": [
+   {
+    "id": 307724791,
+    "type": "Feature",
+    "geometry": {
+     "type": "Point",
+     "coordinates": [
+      4202962.892620435,
+      7520126.155554455
+     ],
+     "crs": {
+      "type": "name",
+      "properties": {
+       "name": "EPSG:3857"
+      }
+     }
+    },
+    "properties": {
+     "category": 37159,
+     "categoryName": "Машино-места",
+     "options": {
+      "area": 14.4,
+      "cad_number": "77:03:0002007:11000",
+      "cancel_date": null,
+      "common_data_status": "Учтенный",
+      "cost_index": 67876.41,
+      "cost_value": 977420.3,
+      "facility_cad_number": null,
+      "floor": "-1/Этаж",
+      "geocoderObject": true,
+      "objdocId": 307724791,
+      "ownership_type": "Частная",
+      "parent_cad_number": "77:03:0002007:10543",
+      "readable_address": "Российская Федерация, город Москва, вн.тер.г. муниципальный округ Гольяново, улица Амурская, дом 1/2/1, машино-место 1",
+      "registersId": 36454,
+      "registration_date": "2024-01-30T00:00:00Z",
+      "removed_GCU": false,
+      "type": "Машино-место"
+     }
+    }
+   }
+  ]
+ },
+ "meta": [
+  {
+   "totalCount": 1,
+   "categoryId": 37159
+  }
+ ],
+ "kad_number": "77:03:0002007:11000",
+ "geom_id": 307724791
+}

@@ -1,0 +1,61 @@
+{
+ "data": {
+  "type": "FeatureCollection",
+  "features": [
+   {
+    "id": 394713401,
+    "type": "Feature",
+    "geometry": {
+     "type": "Point",
+     "coordinates": [
+      4202487.546865789,
+      7519720.193815213
+     ],
+     "crs": {
+      "type": "name",
+      "properties": {
+       "name": "EPSG:3857"
+      }
+     }
+    },
+    "properties": {
+     "category": 37163,
+     "categoryName": "Помещения",
+     "options": {
+      "area": 87.4,
+      "cad_number": "77:03:0002007:12000",
+      "cancel_date": null,
+      "common_data_status": "Учтенный",
+      "common_property": null,
+      "cost_index": 278601.35,
+      "cost_value": 24349757.99,
+      "facility_cad_number": null,
+      "floor": [
+       "4/Этаж"
+      ],
+      "geocoderObject": true,
+      "objdocId": 394713401,
+      "ownership_type": "Частная",
+      "params_type": "Квартира",
+      "parent_cad_number": "77:03:0002007:11157",
+      "purpose": "Жилое",
+      "readable_address": "Российская Федерация, г. Москва, вн.тер.г. муниципальный округ Гольяново, ул. Амурская, д. 2 к. 2, кв. 44",
+      "registersId": 36455,
+      "registration_date": "2024-03-12T00:00:00Z",
+      "removed_GCU": false,
+      "service_common_property": null,
+      "type": "Помещение"
+     }
+    }
+   }
+  ]
+ },
+ "meta": [
+  {
+   "totalCount": 1,
+   "categoryId": 37163
+  }
+ ],
+ "kad_number": "77:03:0002007:12000",
+ "geom_id": 394713401
+}
