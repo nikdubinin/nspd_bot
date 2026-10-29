@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Message, Update
 from telegram.error import BadRequest
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
+from .activity import Activity
 from .cadastral import extract_kad_numbers
 from .config import Settings
 from .formatting import (
@@ -76,6 +78,10 @@ def _settings(context: ContextTypes.DEFAULT_TYPE) -> Settings:
     return context.application.bot_data["settings"]
 
 
+def _activity(context: ContextTypes.DEFAULT_TYPE) -> Activity:
+    return context.application.bot_data["activity"]
+
+
 def _is_short(context: ContextTypes.DEFAULT_TYPE) -> bool:
     return (context.chat_data or {}).get("view_mode") == "short"
 
@@ -139,17 +145,21 @@ async def _render_card(
     force: bool = False,
 ) -> None:
     """Запрашивает объект и выводит карточку в уже отправленное сообщение `message`."""
+    service, activity = _service(context), _activity(context)
+    cached = not force and service.is_cached(kad_number)
+    started = time.monotonic()
     try:
-        obj = await _service(context).get_object(kad_number, force=force)
+        obj = await service.get_object(kad_number, force=force)
     except NspdNotFound:
+        activity.lookup(kad_number, not_found=True, seconds=time.monotonic() - started, cached=cached, refresh=force)
         await _safe_edit(
             message,
             f"Объект <code>{esc(kad_number)}</code> в НСПД не найден.\n"
             "Проверьте номер — возможно, объект снят с учёта или номер введён с ошибкой.",
         )
         return
-    except NspdUnavailable as exc:
-        logger.warning("НСПД недоступна для %s: %s", kad_number, exc)
+    except NspdUnavailable:
+        activity.lookup(kad_number, seconds=time.monotonic() - started, refresh=force)
         await _safe_edit(
             message,
             f"НСПД сейчас не отвечает на запрос по <code>{esc(kad_number)}</code>.\n"
@@ -158,6 +168,7 @@ async def _render_card(
         )
         return
 
+    activity.lookup(kad_number, obj=obj, seconds=time.monotonic() - started, cached=cached, refresh=force)
     _remember(context, obj.cad_number)
     await _safe_edit(message, format_card(obj, short=_is_short(context)), reply_markup=card_keyboard(obj))
 
@@ -172,13 +183,18 @@ async def _send_card(message: Message, kad_number: str, context: ContextTypes.DE
 # ------------------------------------------------------------------------------
 
 
+async def track_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Самый первый обработчик: запоминает, кто пишет, и пишет команды в журнал."""
+    _activity(context).track(update)
+
+
 async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Пропускает только пользователей из ALLOWED_USERS (если список задан)."""
     user = update.effective_user
     if _settings(context).is_allowed(user.id if user else None, user.username if user else None):
         return
 
-    logger.warning("Отказано в доступе: id=%s username=%s", user and user.id, user and user.username)
+    _activity(context).denied()
     if update.callback_query:
         await update.callback_query.answer("Нет доступа", show_alert=True)
     elif update.effective_message and user:
@@ -190,7 +206,9 @@ async def access_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("Ошибка при обработке обновления", exc_info=context.error)
+    # Трассировка — в файл, в консоль — одна строка через журнал действий
+    logger.error("Ошибка при обработке обновления", exc_info=context.error, extra={"console": False})
+    _activity(context).error(context.error)
     if isinstance(update, Update) and update.effective_message:
         try:
             await update.effective_message.reply_text(
@@ -266,6 +284,9 @@ async def _ask_pledge_numbers(
 ) -> None:
     """Включает режим ожидания списка номеров для общего предложения по залогу."""
     context.chat_data[PLEDGE_KEY] = [first] if first else []
+    _activity(context).action(
+        f"займ под залог, несколько объектов{f' (первый {first})' if first else ''} · ждёт номера"
+    )
     already = f"Объект <code>{esc(first)}</code> уже в списке.\n" if first else ""
     await message.reply_text(
         "<b>Займ под залог нескольких объектов</b>\n\n"
@@ -292,9 +313,11 @@ async def _finish_pledge(message: Message, numbers: list[str], context: ContextT
     all_numbers = all_numbers[:max_batch]
 
     status = await message.reply_text(f"⏳ Запрашиваю в НСПД объектов для залога: {len(all_numbers)}…")
+    started = time.monotonic()
     results = await _fetch_many(context, all_numbers)
     objects = [obj for _, obj, _ in results if obj is not None]
     failed = [(kad, err) for kad, obj, err in results if obj is None]
+    _activity(context).pledge(all_numbers, len(objects), time.monotonic() - started)
 
     if not objects:
         await _safe_edit(
@@ -333,6 +356,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if not numbers:
+        _activity(context).unrecognized(message.text or "")
         await message.reply_text(
             "Не удалось распознать кадастровый номер.\n\n"
             f"Пришлите его в формате <code>{EXAMPLE_NUMBER}</code> "
@@ -369,8 +393,10 @@ async def _send_batch(message: Message, numbers: list[str], context: ContextType
     numbers = numbers[:max_batch]
 
     status = await message.reply_text(f"⏳ Запрашиваю в НСПД объектов: {len(numbers)}…")
+    started = time.monotonic()
     results = await _fetch_many(context, numbers)
     found = [obj.cad_number for _, obj, _ in results if obj is not None]
+    _activity(context).batch(numbers, len(found), time.monotonic() - started)
     for cad in reversed(found):
         _remember(context, cad)
 
@@ -412,8 +438,11 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _render_card(message, kad_number, context, force=True)
         return
 
+    activity = _activity(context)
+
     if action == "loan":
         await query.answer()
+        activity.action(f"займ под залог · {kad_number} · выбирает: один или несколько")
         await message.reply_text(
             f"Займ под залог по объекту <code>{esc(kad_number)}</code>.\n"
             "Сколько объектов предлагается к залогу?",
@@ -431,6 +460,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if action == "plcancel":
         context.chat_data.pop(PLEDGE_KEY, None)
+        activity.action("отменил ввод объектов для залога")
         await query.answer("Отменено")
         await _safe_edit(message, "Ввод объектов для залога отменён.")
         return
@@ -449,10 +479,13 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if action == "rel":
         related = await _service(context).get_related(obj)
+        activity.action(f"связанные объекты · {kad_number} · найдено {len(related)}")
         await message.reply_text(format_related(obj, related), reply_markup=numbers_keyboard(related))
     elif action in ("loan1", "buy"):
+        activity.offer("займ под залог, один объект" if action == "loan1" else "срочный выкуп", kad_number)
         await message.reply_text(format_offer(obj, "loan" if action == "loan1" else "buyout"))
     elif action == "json":
+        activity.action(f"скачал JSON · {kad_number}")
         payload = json.dumps(obj.raw, ensure_ascii=False, indent=2).encode("utf-8")
         await message.reply_document(
             InputFile(payload, filename=f"{kad_number.replace(':', '_')}.json"),

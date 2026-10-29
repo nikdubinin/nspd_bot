@@ -4,11 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from nspdbot import handlers
+from nspdbot.activity import (
+    ACTIVITY_LOGGER,
+    Activity,
+    ConsoleFilter,
+    ConsoleFormatter,
+    format_duration,
+    user_label,
+)
 from nspdbot.cadastral import extract_kad_numbers, normalize_kad_number
 from nspdbot.config import Settings
 from nspdbot.formatting import (
@@ -200,7 +209,7 @@ class PledgeDialogTests(unittest.TestCase):
         service.get_object = get_object
         context = mock.Mock()
         context.chat_data = {}
-        context.application.bot_data = {"nspd": service, "settings": Settings(token="x")}
+        context.application.bot_data = {"nspd": service, "settings": Settings(token="x"), "activity": Activity()}
         return context
 
     def _message(self):
@@ -235,6 +244,81 @@ class PledgeDialogTests(unittest.TestCase):
         message, _ = self._message()
         asyncio.run(handlers._finish_pledge(message, [], context))
         self.assertIn(handlers.PLEDGE_KEY, context.chat_data)
+
+
+def _update(user_id=1, first="Иван", last="Петров", username="ivan", chat_type="private", title=None, text=None):
+    user = mock.Mock(id=user_id, first_name=first, last_name=last, username=username)
+    chat = mock.Mock(type=chat_type, title=title)
+    message = mock.Mock(text=text) if text is not None else None
+    return mock.Mock(effective_user=user, effective_chat=chat, message=message)
+
+
+class ActivityTests(unittest.TestCase):
+    def setUp(self):
+        self.activity = Activity()
+
+    def _lines(self, fn):
+        with self.assertLogs(ACTIVITY_LOGGER, level="INFO") as logs:
+            fn()
+        return [r.getMessage() for r in logs.records]
+
+    def test_user_label(self):
+        self.assertEqual(user_label(_update().effective_user), "Иван Петров (@ivan)")
+        anon = _update(user_id=5, last=None, username=None)
+        self.assertEqual(user_label(anon.effective_user), "Иван (id 5)")
+        group = _update(chat_type="supergroup", title="Брокеры")
+        self.assertEqual(user_label(group.effective_user, group.effective_chat), "Иван Петров (@ivan) в «Брокеры»")
+
+    def test_new_user_and_command(self):
+        def run():
+            self.activity.track(_update(text="/start"))
+            self.activity.track(_update(text="/help"))
+
+        lines = self._lines(run)
+        self.assertEqual(len(lines), 3)  # НОВЫЙ один раз + две команды
+        self.assertTrue(lines[0].startswith("НОВЫЙ"))
+        self.assertIn("id 1", lines[0])
+        self.assertIn("Иван Петров (@ivan): /help", lines[2])
+
+    def test_lookup_lines_use_current_user(self):
+        obj = load("land", "77:01:0001001:1000")
+
+        def run():
+            self.activity.track(_update(text="77:01:0001001:1000"))
+            self.activity.lookup(obj.cad_number, obj=obj, seconds=1.234)
+            self.activity.lookup(obj.cad_number, obj=obj, cached=True)
+            self.activity.lookup("77:01:0001001:999", not_found=True, seconds=0.5)
+
+        lines = self._lines(run)
+        self.assertIn("Иван Петров (@ivan) → 77:01:0001001:1000 · Земельный участок · г. Москва", lines[1])
+        self.assertTrue(lines[1].endswith("1,2 с"))
+        self.assertTrue(lines[2].endswith("из кэша"))
+        self.assertIn("не найден в НСПД", lines[3])
+        summary = self.activity.summary()
+        self.assertIn("пользователей 1", summary)
+        self.assertIn("запросов 3 (найдено 2, не найдено 1, сбоев 0)", summary)
+
+    def test_console_formatter_and_filter(self):
+        formatter, flt = ConsoleFormatter(), ConsoleFilter()
+        act = logging.LogRecord(ACTIVITY_LOGGER, logging.INFO, "", 0, "ЗАПРОС    текст", None, None)
+        self.assertRegex(formatter.format(act), r"^\d\d:\d\d:\d\d  ЗАПРОС    текст$")
+        self.assertTrue(flt.filter(act))
+
+        info = logging.LogRecord("telegram.ext", logging.INFO, "", 0, "шум", None, None)
+        self.assertFalse(flt.filter(info))
+
+        warn = logging.LogRecord("nspdbot.nspd_service", logging.WARNING, "", 0, "попытка 1/3", None, None)
+        self.assertTrue(flt.filter(warn))
+        self.assertIn("ВНИМАНИЕ  попытка 1/3", formatter.format(warn))
+
+        hidden = logging.LogRecord("nspdbot.handlers", logging.ERROR, "", 0, "трассировка", None, None)
+        hidden.console = False
+        self.assertFalse(flt.filter(hidden))
+
+    def test_format_duration(self):
+        self.assertEqual(format_duration(45), "45 с")
+        self.assertEqual(format_duration(252), "4 мин 12 с")
+        self.assertEqual(format_duration(3900), "1 ч 5 мин")
 
 
 class ServiceTests(unittest.TestCase):

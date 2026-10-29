@@ -21,6 +21,7 @@ from telegram.ext import (
 )
 
 from . import __version__, handlers
+from .activity import Activity, ConsoleFilter, ConsoleFormatter
 from .config import Settings, load_settings
 from .nspd_service import NspdService
 
@@ -45,8 +46,10 @@ def setup_logging(settings: Settings) -> None:
         settings.log_dir / "bot.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
+    # В консоли — только читаемый журнал действий и предупреждения, подробности — в файле
     console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
+    console_handler.setFormatter(ConsoleFormatter())
+    console_handler.addFilter(ConsoleFilter())
 
     logging.basicConfig(level=settings.log_level, handlers=[console_handler, file_handler], force=True)
     # httpx пишет в INFO каждый long-polling запрос к Telegram — это шум
@@ -54,10 +57,29 @@ def setup_logging(settings: Settings) -> None:
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
+HEARTBEAT_SECONDS = 60 * 60
+
+
+async def _heartbeat(activity: Activity) -> None:
+    while True:
+        await asyncio.sleep(HEARTBEAT_SECONDS)
+        activity.heartbeat()
+
+
 async def _post_init(application: Application) -> None:
     await application.bot.set_my_commands(BOT_COMMANDS)
     me = await application.bot.get_me()
-    logger.info("Бот @%s (v%s) запущен. Ожидание сообщений…", me.username, __version__)
+    settings: Settings = application.bot_data["settings"]
+    activity: Activity = application.bot_data["activity"]
+    activity.startup(me.username, __version__, len(settings.allowed_ids) + len(settings.allowed_usernames))
+    application.bot_data["heartbeat"] = asyncio.create_task(_heartbeat(activity))
+
+
+async def _post_shutdown(application: Application) -> None:
+    task = application.bot_data.pop("heartbeat", None)
+    if task is not None:
+        task.cancel()
+    application.bot_data["activity"].shutdown()
 
 
 def build_application(settings: Settings) -> Application:
@@ -75,12 +97,14 @@ def build_application(settings: Settings) -> Application:
         .persistence(persistence)
         .concurrent_updates(True)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
     )
     if settings.proxy:
         builder = builder.proxy(settings.proxy).get_updates_proxy(settings.proxy)
     application = builder.build()
 
     application.bot_data["settings"] = settings
+    application.bot_data["activity"] = Activity()
     application.bot_data["nspd"] = NspdService(
         timeout=settings.nspd_timeout,
         retries=settings.nspd_retries,
@@ -88,6 +112,7 @@ def build_application(settings: Settings) -> Application:
         cache_ttl=settings.cache_ttl_seconds,
     )
 
+    application.add_handler(TypeHandler(Update, handlers.track_update), group=-2)
     if settings.access_restricted:
         application.add_handler(TypeHandler(Update, handlers.access_guard), group=-1)
 
@@ -108,12 +133,6 @@ def build_application(settings: Settings) -> Application:
 def main() -> None:
     settings = load_settings()
     setup_logging(settings)
-    if settings.access_restricted:
-        logger.info(
-            "Доступ ограничен: %d ID, %d username",
-            len(settings.allowed_ids), len(settings.allowed_usernames),
-        )
-
     application = build_application(settings)
 
     # В Python 3.12+ в главном потоке нет «текущего» event loop,

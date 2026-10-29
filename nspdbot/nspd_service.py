@@ -86,6 +86,10 @@ class NspdService:
 
     # ------------------------------------------------------------------ public
 
+    def is_cached(self, kad_number: str) -> bool:
+        """Есть ли свежий ответ в кэше (для журнала: «из кэша»)."""
+        return self._objects.get(kad_number) is not None or bool(self._not_found.get(kad_number))
+
     async def get_object(self, kad_number: str, *, force: bool = False) -> NspdObject:
         """Возвращает объект НСПД. Бросает NspdNotFound / NspdUnavailable."""
         if force:
