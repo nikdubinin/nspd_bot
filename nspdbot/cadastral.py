@@ -67,18 +67,21 @@ def normalize_kad_number(raw: str) -> str | None:
 def extract_kad_numbers(text: str) -> list[str]:
     """Находит все кадастровые номера в тексте (без дублей, в порядке появления).
 
-    Номера с двоеточиями ищутся по всему тексту; если таких нет — текст
-    разбивается по строкам/запятым/точкам с запятой и каждая часть
-    нормализуется отдельно.
+    Текст разбивается по строкам/запятым/точкам с запятой. В каждой части
+    ищутся номера с двоеточиями (их может быть несколько), а если таких нет —
+    часть нормализуется целиком. Так в одном списке можно смешивать форматы.
     """
     if not text:
         return []
 
-    normalized = _SPACES_AROUND_COLON_RE.sub(":", text)
-    found = [":".join(m.groups()) for m in _COLON_RE.finditer(normalized) if _is_valid(*m.groups())]
-
-    if not found:
-        found = [n for chunk in _CHUNK_SPLIT_RE.split(text) if (n := normalize_kad_number(chunk))]
+    found: list[str] = []
+    for chunk in _CHUNK_SPLIT_RE.split(text):
+        normalized = _SPACES_AROUND_COLON_RE.sub(":", chunk)
+        matches = [":".join(m.groups()) for m in _COLON_RE.finditer(normalized) if _is_valid(*m.groups())]
+        if matches:
+            found += matches
+        elif number := normalize_kad_number(chunk):
+            found.append(number)
 
     return list(dict.fromkeys(found))
 

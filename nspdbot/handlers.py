@@ -20,6 +20,7 @@ from .formatting import (
     format_batch_line,
     format_card,
     format_offer,
+    format_pledge_offer,
     format_related,
     nspd_url,
     yandex_maps_url,
@@ -30,6 +31,7 @@ from .nspd_service import NspdNotFound, NspdService, NspdUnavailable
 logger = logging.getLogger(__name__)
 
 HISTORY_SIZE = 15
+PLEDGE_KEY = "pledge_pending"
 EXAMPLE_NUMBER = "77:01:0001001:1000"
 
 HELP_TEXT = (
@@ -45,11 +47,15 @@ HELP_TEXT = (
     "/short — краткие карточки\n"
     "/full — подробные карточки\n"
     "/history — последние запросы\n"
+    "/pledge — займ под залог нескольких объектов\n"
+    "/cancel — отменить ввод номеров\n"
     "/help — эта справка\n\n"
     "<b>Кнопки под карточкой</b>\n"
     "• НСПД / Яндекс.Карты — объект на карте\n"
     "• Связанные объекты — здания на участке, участки под зданием, здание для помещения\n"
-    "• Займ под залог / Срочный выкуп — заготовка текста для инвесторов\n"
+    "• Займ под залог — бот спросит, один объект в залоге или несколько, "
+    "и соберёт общий текст по всем объектам\n"
+    "• Срочный выкуп — заготовка текста для инвесторов\n"
     "• Обновить — запросить свежие данные, минуя кэш\n"
     "• JSON — исходный ответ НСПД файлом\n\n"
     "<i>Сведения о правообладателях и обременениях НСПД в открытом доступе не публикует — "
@@ -239,6 +245,80 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     )
 
 
+async def pledge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await _ask_pledge_numbers(update.effective_message, context, first=None)
+
+
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if context.chat_data.pop(PLEDGE_KEY, None) is None:
+        await update.effective_message.reply_text("Отменять нечего.")
+    else:
+        await update.effective_message.reply_text("Ввод объектов для залога отменён.")
+
+
+# ------------------------------------------------------------------------------
+# Займ под залог нескольких объектов
+# ------------------------------------------------------------------------------
+
+
+async def _ask_pledge_numbers(
+    message: Message, context: ContextTypes.DEFAULT_TYPE, *, first: str | None
+) -> None:
+    """Включает режим ожидания списка номеров для общего предложения по залогу."""
+    context.chat_data[PLEDGE_KEY] = [first] if first else []
+    already = f"Объект <code>{esc(first)}</code> уже в списке.\n" if first else ""
+    await message.reply_text(
+        "<b>Займ под залог нескольких объектов</b>\n\n"
+        f"{already}"
+        f"Пришлите кадастровые номера {'остальных ' if first else ''}объектов, "
+        "каждый с новой строки — я соберу одно предложение по всем объектам сразу.",
+        reply_markup=InlineKeyboardMarkup([[_btn("✖ Отмена", "plcancel", "-")]]),
+    )
+
+
+async def _finish_pledge(message: Message, numbers: list[str], context: ContextTypes.DEFAULT_TYPE) -> None:
+    pending: list[str] = context.chat_data.get(PLEDGE_KEY) or []
+    if not numbers:
+        await message.reply_text(
+            "Не удалось распознать кадастровые номера.\n"
+            "Пришлите их каждый с новой строки или нажмите /cancel, чтобы отменить.",
+        )
+        return
+
+    context.chat_data.pop(PLEDGE_KEY, None)
+    max_batch = _settings(context).max_batch
+    all_numbers = list(dict.fromkeys(pending + numbers))
+    skipped = all_numbers[max_batch:]
+    all_numbers = all_numbers[:max_batch]
+
+    status = await message.reply_text(f"⏳ Запрашиваю в НСПД объектов для залога: {len(all_numbers)}…")
+    results = await _fetch_many(context, all_numbers)
+    objects = [obj for _, obj, _ in results if obj is not None]
+    failed = [(kad, err) for kad, obj, err in results if obj is None]
+
+    if not objects:
+        await _safe_edit(
+            status,
+            "Не удалось получить данные ни по одному объекту — предложение не сформировано.\n"
+            + "\n".join(f"• <code>{esc(kad)}</code> — {esc(err)}" for kad, err in failed),
+        )
+        return
+
+    for obj in reversed(objects):
+        _remember(context, obj.cad_number)
+
+    report = [f"Предложение по залогу сформировано: объектов {len(objects)} из {len(all_numbers)}."]
+    if failed:
+        report.append("\n<b>Не вошли в предложение:</b>")
+        report += [f"• <code>{esc(kad)}</code> — {esc(err)}" for kad, err in failed]
+    if skipped:
+        report.append(f"\n<i>Обработаны первые {max_batch} номеров, пропущено: {len(skipped)}.</i>")
+    await _safe_edit(status, fit_message("\n".join(report)))
+
+    for text in format_pledge_offer(objects):
+        await message.reply_text(text)
+
+
 # ------------------------------------------------------------------------------
 # Текстовые сообщения
 # ------------------------------------------------------------------------------
@@ -247,6 +327,10 @@ async def history_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     numbers = extract_kad_numbers(message.text or "")
+
+    if context.chat_data is not None and PLEDGE_KEY in context.chat_data:
+        await _finish_pledge(message, numbers, context)
+        return
 
     if not numbers:
         await message.reply_text(
@@ -262,12 +346,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await _send_batch(message, numbers, context)
 
 
-async def _send_batch(message: Message, numbers: list[str], context: ContextTypes.DEFAULT_TYPE) -> None:
-    max_batch = _settings(context).max_batch
-    skipped = len(numbers) - max_batch
-    numbers = numbers[:max_batch]
-
-    status = await message.reply_text(f"⏳ Запрашиваю в НСПД объектов: {len(numbers)}…")
+async def _fetch_many(
+    context: ContextTypes.DEFAULT_TYPE, numbers: list[str]
+) -> list[tuple[str, NspdObject | None, str | None]]:
+    """Параллельно запрашивает номера; ошибки возвращаются текстом, а не исключением."""
     service = _service(context)
 
     async def fetch(kad: str) -> tuple[str, NspdObject | None, str | None]:
@@ -278,7 +360,16 @@ async def _send_batch(message: Message, numbers: list[str], context: ContextType
         except NspdUnavailable:
             return kad, None, "НСПД не ответила"
 
-    results = await asyncio.gather(*(fetch(kad) for kad in numbers))
+    return list(await asyncio.gather(*(fetch(kad) for kad in numbers)))
+
+
+async def _send_batch(message: Message, numbers: list[str], context: ContextTypes.DEFAULT_TYPE) -> None:
+    max_batch = _settings(context).max_batch
+    skipped = len(numbers) - max_batch
+    numbers = numbers[:max_batch]
+
+    status = await message.reply_text(f"⏳ Запрашиваю в НСПД объектов: {len(numbers)}…")
+    results = await _fetch_many(context, numbers)
     found = [obj.cad_number for _, obj, _ in results if obj is not None]
     for cad in reversed(found):
         _remember(context, cad)
@@ -321,6 +412,29 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await _render_card(message, kad_number, context, force=True)
         return
 
+    if action == "loan":
+        await query.answer()
+        await message.reply_text(
+            f"Займ под залог по объекту <code>{esc(kad_number)}</code>.\n"
+            "Сколько объектов предлагается к залогу?",
+            reply_markup=InlineKeyboardMarkup([[
+                _btn("1️⃣ Один объект", "loan1", kad_number),
+                _btn("🔢 Несколько объектов", "loanm", kad_number),
+            ]]),
+        )
+        return
+
+    if action == "loanm":
+        await query.answer()
+        await _ask_pledge_numbers(message, context, first=kad_number)
+        return
+
+    if action == "plcancel":
+        context.chat_data.pop(PLEDGE_KEY, None)
+        await query.answer("Отменено")
+        await _safe_edit(message, "Ввод объектов для залога отменён.")
+        return
+
     # Остальные действия работают с уже полученным объектом
     try:
         obj = await _service(context).get_object(kad_number)
@@ -336,8 +450,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if action == "rel":
         related = await _service(context).get_related(obj)
         await message.reply_text(format_related(obj, related), reply_markup=numbers_keyboard(related))
-    elif action in ("loan", "buy"):
-        await message.reply_text(format_offer(obj, "loan" if action == "loan" else "buyout"))
+    elif action in ("loan1", "buy"):
+        await message.reply_text(format_offer(obj, "loan" if action == "loan1" else "buyout"))
     elif action == "json":
         payload = json.dumps(obj.raw, ensure_ascii=False, indent=2).encode("utf-8")
         await message.reply_document(

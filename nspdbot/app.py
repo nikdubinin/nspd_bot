@@ -32,6 +32,8 @@ BOT_COMMANDS = [
     BotCommand("short", "Краткие карточки"),
     BotCommand("full", "Подробные карточки"),
     BotCommand("history", "Последние запросы"),
+    BotCommand("pledge", "Залог нескольких объектов"),
+    BotCommand("cancel", "Отменить ввод номеров"),
 ]
 
 
@@ -94,6 +96,8 @@ def build_application(settings: Settings) -> Application:
     application.add_handler(CommandHandler("short", handlers.short_mode_handler))
     application.add_handler(CommandHandler("full", handlers.full_mode_handler))
     application.add_handler(CommandHandler("history", handlers.history_handler))
+    application.add_handler(CommandHandler("pledge", handlers.pledge_handler))
+    application.add_handler(CommandHandler("cancel", handlers.cancel_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handlers.text_handler))
     application.add_handler(CallbackQueryHandler(handlers.callback_handler))
     application.add_error_handler(handlers.error_handler)

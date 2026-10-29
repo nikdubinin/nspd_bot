@@ -8,8 +8,17 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from nspdbot import handlers
 from nspdbot.cadastral import extract_kad_numbers, normalize_kad_number
-from nspdbot.formatting import build_csv, fit_message, fmt_number, format_card, format_offer
+from nspdbot.config import Settings
+from nspdbot.formatting import (
+    build_csv,
+    fit_message,
+    fmt_number,
+    format_card,
+    format_offer,
+    format_pledge_offer,
+)
 from nspdbot.models import NspdObject, ObjectKind
 from nspdbot.nspd_service import NspdNotFound, NspdService, NspdUnavailable
 
@@ -44,6 +53,13 @@ class CadastralTests(unittest.TestCase):
     def test_extract_many(self):
         text = "Проверь 77:01:0001001:1000, 77:01:0001001:1020\nи ещё 77:01:0001001:1000"
         self.assertEqual(extract_kad_numbers(text), ["77:01:0001001:1000", "77:01:0001001:1020"])
+
+    def test_extract_mixed_formats(self):
+        text = "77:03:0002007:12000\n77 01 0001001 1000\n77030002007 7190 77:01:0001001:1020"
+        self.assertEqual(
+            extract_kad_numbers(text),
+            ["77:03:0002007:12000", "77:01:0001001:1000", "77:01:0001001:1020"],
+        )
 
     def test_extract_many_without_colons(self):
         text = "77 01 0001001 1000\n77030002007 7190"
@@ -133,6 +149,92 @@ class FormattingTests(unittest.TestCase):
         text = data.decode("utf-8-sig")
         self.assertEqual(len(text.strip().splitlines()), 3)
         self.assertIn("77:01:0001001:1000;Земельный участок", text)
+
+
+class PledgeOfferTests(unittest.TestCase):
+    def setUp(self):
+        self.objects = [
+            load("land", "77:01:0001001:1000"),
+            load("building", "77:01:0001001:1020"),
+            load("flat", "77:03:0002007:12000"),
+        ]
+
+    def test_single_object_is_regular_offer(self):
+        self.assertEqual(format_pledge_offer(self.objects[:1]), [format_offer(self.objects[0], "loan")])
+
+    def test_several_objects(self):
+        messages = format_pledge_offer(self.objects)
+        text = "\n".join(messages)
+        for obj in self.objects:
+            self.assertIn(obj.cad_number, text)
+        self.assertIn("займ под залог 3 объектов", text)
+        self.assertIn("<b>Объект 3.</b> Квартира", text)
+        total = sum(o.cost_value for o in self.objects)
+        self.assertIn(fmt_number(total), text)
+        self.assertIn("предметов залога", text)
+        self.assertIn("Зарегистрированные лица", text)  # есть квартира
+
+    def test_long_offer_is_split(self):
+        objects = []
+        for i in range(20):
+            obj = load("land", "77:01:0001001:1000")
+            obj.cad_number = f"77:01:0001001:{1000 + i}"
+            objects.append(obj)
+        messages = format_pledge_offer(objects)
+        self.assertGreater(len(messages), 1)
+        self.assertTrue(all(len(m) <= 4096 for m in messages))
+        text = "\n".join(messages)
+        for obj in objects:
+            self.assertIn(obj.cad_number, text)
+        self.assertTrue(messages[-1].endswith("Ждём ваших предложений и вопросов."))
+
+
+class PledgeDialogTests(unittest.TestCase):
+    def _context(self, objects: dict):
+        async def get_object(kad, force=False):
+            if kad in objects:
+                return objects[kad]
+            raise NspdNotFound(kad)
+
+        service = mock.Mock()
+        service.get_object = get_object
+        context = mock.Mock()
+        context.chat_data = {}
+        context.application.bot_data = {"nspd": service, "settings": Settings(token="x")}
+        return context
+
+    def _message(self):
+        message = mock.Mock()
+        status = mock.Mock()
+        status.edit_text = mock.AsyncMock()
+        message.reply_text = mock.AsyncMock(return_value=status)
+        return message, status
+
+    def test_flow_from_card(self):
+        land = load("land", "77:01:0001001:1000")
+        flat = load("flat", "77:03:0002007:12000")
+        context = self._context({land.cad_number: land, flat.cad_number: flat})
+        message, status = self._message()
+
+        asyncio.run(handlers._ask_pledge_numbers(message, context, first=land.cad_number))
+        self.assertEqual(context.chat_data[handlers.PLEDGE_KEY], [land.cad_number])
+
+        numbers = extract_kad_numbers("77:01:0001001:1000\n77:03:0002007:12000\n77:01:0001001:999999")
+        asyncio.run(handlers._finish_pledge(message, numbers, context))
+
+        self.assertNotIn(handlers.PLEDGE_KEY, context.chat_data)
+        report = status.edit_text.call_args.args[0]
+        self.assertIn("объектов 2 из 3", report)
+        self.assertIn("77:01:0001001:999999", report)
+        offer = message.reply_text.call_args.args[0]
+        self.assertIn("займ под залог 2 объектов", offer)
+
+    def test_no_numbers_keeps_waiting(self):
+        context = self._context({})
+        context.chat_data[handlers.PLEDGE_KEY] = []
+        message, _ = self._message()
+        asyncio.run(handlers._finish_pledge(message, [], context))
+        self.assertIn(handlers.PLEDGE_KEY, context.chat_data)
 
 
 class ServiceTests(unittest.TestCase):

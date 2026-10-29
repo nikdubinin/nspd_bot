@@ -234,17 +234,20 @@ def format_related(obj: NspdObject, related: list[str], *, limit: int = 50) -> s
 
 _BLANK = "__________________"
 
+_LOAN_TERMS = [
+    "",
+    "<b>Параметры займа</b>",
+    f"• Требуемая сумма: {_BLANK}",
+    f"• Срок: {_BLANK}",
+    f"• Цель: {_BLANK}",
+    "",
+    "<b>Информация о заёмщике</b>",
+    f"• Место работы / должность: {_BLANK}",
+    f"• Ежемесячный доход: {_BLANK}",
+]
 
-def format_offer(obj: NspdObject, kind: OfferKind) -> str:
-    noun, located = obj.noun_phrase()
 
-    title = "Предложение по займу под залог" if kind == "loan" else "Предложение на срочный выкуп"
-    lines = [f"<b>{title}</b>", "", "Добрый день, уважаемые коллеги!", ""]
-
-    intro = f"Вашему вниманию предлагается {esc(noun)} с кадастровым номером <code>{esc(obj.cad_number)}</code>"
-    intro += f", {located} по адресу: {esc(obj.address)}." if obj.address else "."
-    lines += [intro, "", "<b>Характеристики объекта</b>"]
-
+def _offer_characteristics(obj: NspdObject) -> list[str]:
     characteristics = _compact([
         f"• Площадь: {esc(_area(obj))}" if obj.area else None,
         f"• Категория земель: {esc(obj.land_category)}" if obj.land_category else None,
@@ -257,20 +260,22 @@ def format_offer(obj: NspdObject, kind: OfferKind) -> str:
         if (obj.year_built or obj.year_commissioning) else None,
         f"• Кадастровая стоимость: {esc(_money(obj.cost_value))}" if obj.cost_value is not None else None,
     ])
-    lines.extend(characteristics or ["• Характеристики в открытых данных НСПД не заполнены."])
+    return characteristics or ["• Характеристики в открытых данных НСПД не заполнены."]
+
+
+def format_offer(obj: NspdObject, kind: OfferKind) -> str:
+    noun, located = obj.noun_phrase()
+
+    title = "Предложение по займу под залог" if kind == "loan" else "Предложение на срочный выкуп"
+    lines = [f"<b>{title}</b>", "", "Добрый день, уважаемые коллеги!", ""]
+
+    intro = f"Вашему вниманию предлагается {esc(noun)} с кадастровым номером <code>{esc(obj.cad_number)}</code>"
+    intro += f", {located} по адресу: {esc(obj.address)}." if obj.address else "."
+    lines += [intro, "", "<b>Характеристики объекта</b>"]
+    lines.extend(_offer_characteristics(obj))
 
     if kind == "loan":
-        lines += [
-            "",
-            "<b>Параметры займа</b>",
-            f"• Требуемая сумма: {_BLANK}",
-            f"• Срок: {_BLANK}",
-            f"• Цель: {_BLANK}",
-            "",
-            "<b>Информация о заёмщике</b>",
-            f"• Место работы / должность: {_BLANK}",
-            f"• Ежемесячный доход: {_BLANK}",
-        ]
+        lines += _LOAN_TERMS
         documents = "• Документы и фотографии предмета залога прилагаются."
     else:
         lines += [
@@ -291,6 +296,70 @@ def format_offer(obj: NspdObject, kind: OfferKind) -> str:
         "Ждём ваших предложений и вопросов.",
     ]
     return fit_message("\n".join(line for line in lines if line is not None))
+
+
+def format_pledge_offer(objects: list[NspdObject]) -> list[str]:
+    """Предложение по займу под залог нескольких объектов.
+
+    Возвращает список сообщений: длинный текст делится по границам объектов,
+    чтобы не превысить лимит Telegram.
+    """
+    if len(objects) == 1:
+        return [format_offer(objects[0], "loan")]
+
+    blocks = [
+        "\n".join([
+            "<b>Предложение по займу под залог</b>",
+            "",
+            "Добрый день, уважаемые коллеги!",
+            "",
+            f"Вашему вниманию предлагается займ под залог {len(objects)} объектов недвижимости.",
+        ])
+    ]
+
+    for index, obj in enumerate(objects, 1):
+        noun, located = obj.noun_phrase()
+        head = f"<b>Объект {index}.</b> {esc(noun.capitalize())}, кадастровый номер <code>{esc(obj.cad_number)}</code>"
+        head += f", {located} по адресу: {esc(obj.address)}." if obj.address else "."
+        blocks.append("\n".join([head, *_offer_characteristics(obj)]))
+
+    total_cost = sum(obj.cost_value for obj in objects if obj.cost_value is not None)
+    has_cost = [obj for obj in objects if obj.cost_value is not None]
+    summary = ["<b>Итого по залогу</b>", f"• Количество объектов: {len(objects)}"]
+    if has_cost:
+        note = "" if len(has_cost) == len(objects) else f" (по {len(has_cost)} из {len(objects)} объектов)"
+        summary.append(f"• Суммарная кадастровая стоимость: {esc(_money(total_cost))}{note}")
+    blocks.append("\n".join(summary))
+
+    has_premises = any(obj.kind is ObjectKind.PREMISES for obj in objects)
+    blocks.append("\n".join([
+        *_LOAN_TERMS[1:],
+        "",
+        "<b>Дополнительно</b>",
+        f"• Обременения: {_BLANK}",
+        *([f"• Зарегистрированные лица: {_BLANK}"] if has_premises else []),
+        "• Документы и фотографии предметов залога прилагаются.",
+        "",
+        "Ждём ваших предложений и вопросов.",
+    ]))
+    return split_message(blocks)
+
+
+def split_message(blocks: list[str], limit: int = TELEGRAM_TEXT_LIMIT) -> list[str]:
+    """Склеивает блоки через пустую строку в сообщения не длиннее limit."""
+    messages: list[str] = []
+    current = ""
+    for block in blocks:
+        block = fit_message(block, limit)
+        candidate = f"{current}\n\n{block}" if current else block
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            messages.append(current)
+            current = block
+    if current:
+        messages.append(current)
+    return messages
 
 
 # ------------------------------------------------------------------------------
