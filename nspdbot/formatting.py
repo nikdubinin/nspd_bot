@@ -234,17 +234,38 @@ def format_related(obj: NspdObject, related: list[str], *, limit: int = 50) -> s
 
 _BLANK = "__________________"
 
-_LOAN_TERMS = [
-    "",
-    "<b>Параметры займа</b>",
-    f"• Требуемая сумма: {_BLANK}",
-    f"• Срок: {_BLANK}",
-    f"• Цель: {_BLANK}",
-    "",
-    "<b>Информация о заёмщике</b>",
-    f"• Место работы / должность: {_BLANK}",
-    f"• Ежемесячный доход: {_BLANK}",
-]
+Answers = dict[str, str] | None
+
+
+def _field(answers: Answers, key: str, label: str) -> str:
+    """«• Срок: 12 месяцев» или пустая графа, если ответа нет."""
+    value = (answers or {}).get(key)
+    return f"• {label}: {esc(value) if value else _BLANK}"
+
+
+def _loan_terms(answers: Answers) -> list[str]:
+    return [
+        "<b>Параметры займа</b>",
+        _field(answers, "amount", "Требуемая сумма"),
+        _field(answers, "term", "Срок"),
+        _field(answers, "purpose", "Цель"),
+        "",
+        "<b>Информация о заёмщике</b>",
+        _field(answers, "job", "Место работы / должность"),
+        _field(answers, "income", "Ежемесячный доход"),
+        _field(answers, "business", "Наличие ИП / СЗ / ООО"),
+    ]
+
+
+def _additional(answers: Answers, *, has_premises: bool, documents: str) -> list[str]:
+    return [
+        "<b>Дополнительно</b>",
+        _field(answers, "encumbrances", "Обременения"),
+        *([_field(answers, "registered", "Зарегистрированные лица")] if has_premises else []),
+        documents,
+        "",
+        "Ждём ваших предложений и вопросов.",
+    ]
 
 
 def _offer_characteristics(obj: NspdObject) -> list[str]:
@@ -263,7 +284,7 @@ def _offer_characteristics(obj: NspdObject) -> list[str]:
     return characteristics or ["• Характеристики в открытых данных НСПД не заполнены."]
 
 
-def format_offer(obj: NspdObject, kind: OfferKind) -> str:
+def format_offer(obj: NspdObject, kind: OfferKind, answers: Answers = None) -> str:
     noun, located = obj.noun_phrase()
 
     title = "Предложение по займу под залог" if kind == "loan" else "Предложение на срочный выкуп"
@@ -275,37 +296,29 @@ def format_offer(obj: NspdObject, kind: OfferKind) -> str:
     lines.extend(_offer_characteristics(obj))
 
     if kind == "loan":
-        lines += _LOAN_TERMS
+        lines += ["", *_loan_terms(answers)]
         documents = "• Документы и фотографии предмета залога прилагаются."
     else:
         lines += [
             "",
             "<b>Параметры сделки</b>",
-            f"• Ожидаемая цена выкупа: {_BLANK}",
-            f"• Желаемый срок сделки: {_BLANK}",
+            _field(answers, "price", "Ожидаемая цена выкупа"),
+            _field(answers, "deadline", "Желаемый срок сделки"),
         ]
         documents = "• Документы и фотографии объекта прилагаются."
 
-    lines += [
-        "",
-        "<b>Дополнительно</b>",
-        f"• Обременения: {_BLANK}",
-        f"• Зарегистрированные лица: {_BLANK}" if obj.kind is ObjectKind.PREMISES else None,
-        documents,
-        "",
-        "Ждём ваших предложений и вопросов.",
-    ]
-    return fit_message("\n".join(line for line in lines if line is not None))
+    lines += ["", *_additional(answers, has_premises=obj.kind is ObjectKind.PREMISES, documents=documents)]
+    return fit_message("\n".join(lines))
 
 
-def format_pledge_offer(objects: list[NspdObject]) -> list[str]:
+def format_pledge_offer(objects: list[NspdObject], answers: Answers = None) -> list[str]:
     """Предложение по займу под залог нескольких объектов.
 
     Возвращает список сообщений: длинный текст делится по границам объектов,
     чтобы не превысить лимит Telegram.
     """
     if len(objects) == 1:
-        return [format_offer(objects[0], "loan")]
+        return [format_offer(objects[0], "loan", answers)]
 
     blocks = [
         "\n".join([
@@ -333,14 +346,11 @@ def format_pledge_offer(objects: list[NspdObject]) -> list[str]:
 
     has_premises = any(obj.kind is ObjectKind.PREMISES for obj in objects)
     blocks.append("\n".join([
-        *_LOAN_TERMS[1:],
+        *_loan_terms(answers),
         "",
-        "<b>Дополнительно</b>",
-        f"• Обременения: {_BLANK}",
-        *([f"• Зарегистрированные лица: {_BLANK}"] if has_premises else []),
-        "• Документы и фотографии предметов залога прилагаются.",
-        "",
-        "Ждём ваших предложений и вопросов.",
+        *_additional(
+            answers, has_premises=has_premises, documents="• Документы и фотографии предметов залога прилагаются."
+        ),
     ]))
     return split_message(blocks)
 

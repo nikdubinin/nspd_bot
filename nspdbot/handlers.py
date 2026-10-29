@@ -27,13 +27,15 @@ from .formatting import (
     nspd_url,
     yandex_maps_url,
 )
-from .models import NspdObject
+from .models import NspdObject, ObjectKind
+from .offer_form import OfferForm, OfferKind
 from .nspd_service import NspdNotFound, NspdService, NspdUnavailable
 
 logger = logging.getLogger(__name__)
 
 HISTORY_SIZE = 15
 PLEDGE_KEY = "pledge_pending"
+FORM_KEY = "offer_form"
 EXAMPLE_NUMBER = "77:01:0001001:1000"
 
 HELP_TEXT = (
@@ -50,14 +52,16 @@ HELP_TEXT = (
     "/full — подробные карточки\n"
     "/history — последние запросы\n"
     "/pledge — займ под залог нескольких объектов\n"
-    "/cancel — отменить ввод номеров\n"
+    "/cancel — отменить ввод номеров или анкету\n"
     "/help — эта справка\n\n"
     "<b>Кнопки под карточкой</b>\n"
     "• НСПД / Яндекс.Карты — объект на карте\n"
     "• Связанные объекты — здания на участке, участки под зданием, здание для помещения\n"
-    "• Займ под залог — бот спросит, один объект в залоге или несколько, "
-    "и соберёт общий текст по всем объектам\n"
-    "• Срочный выкуп — заготовка текста для инвесторов\n"
+    "• Займ под залог — бот спросит, один объект в залоге или несколько, задаст вопросы "
+    "о займе и заёмщике и соберёт готовый текст для инвесторов\n"
+    "• Срочный выкуп — бот спросит цену, сроки и обременения и соберёт текст\n"
+    "На любой вопрос можно ответить текстом, выбрать вариант или пропустить — "
+    "тогда в тексте останется пустая графа.\n"
     "• Обновить — запросить свежие данные, минуя кэш\n"
     "• JSON — исходный ответ НСПД файлом\n\n"
     "<i>Сведения о правообладателях и обременениях НСПД в открытом доступе не публикует — "
@@ -268,10 +272,12 @@ async def pledge_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if context.chat_data.pop(PLEDGE_KEY, None) is None:
-        await update.effective_message.reply_text("Отменять нечего.")
-    else:
+    if context.chat_data.pop(FORM_KEY, None) is not None:
+        await update.effective_message.reply_text("Анкета отменена, предложение не сформировано.")
+    elif context.chat_data.pop(PLEDGE_KEY, None) is not None:
         await update.effective_message.reply_text("Ввод объектов для залога отменён.")
+    else:
+        await update.effective_message.reply_text("Отменять нечего.")
 
 
 # ------------------------------------------------------------------------------
@@ -330,7 +336,10 @@ async def _finish_pledge(message: Message, numbers: list[str], context: ContextT
     for obj in reversed(objects):
         _remember(context, obj.cad_number)
 
-    report = [f"Предложение по залогу сформировано: объектов {len(objects)} из {len(all_numbers)}."]
+    report = [
+        f"Данные из НСПД получены: объектов {len(objects)} из {len(all_numbers)}. "
+        "Осталось ответить на несколько вопросов для текста предложения."
+    ]
     if failed:
         report.append("\n<b>Не вошли в предложение:</b>")
         report += [f"• <code>{esc(kad)}</code> — {esc(err)}" for kad, err in failed]
@@ -338,7 +347,162 @@ async def _finish_pledge(message: Message, numbers: list[str], context: ContextT
         report.append(f"\n<i>Обработаны первые {max_batch} номеров, пропущено: {len(skipped)}.</i>")
     await _safe_edit(status, fit_message("\n".join(report)))
 
-    for text in format_pledge_offer(objects):
+    has_premises = any(obj.kind is ObjectKind.PREMISES for obj in objects)
+    await _start_form(message, context, "loan", [obj.cad_number for obj in objects], has_premises)
+
+
+# ------------------------------------------------------------------------------
+# Анкета: вопросы вместо пустых граф в предложении
+# ------------------------------------------------------------------------------
+
+_FORM_TITLES = {"loan": "Займ под залог", "buyout": "Срочный выкуп"}
+
+
+def _question_text(form: OfferForm) -> str:
+    question = form.current
+    assert question is not None
+    lines = [f"<b>{_FORM_TITLES[form.kind]}</b> · вопрос {form.progress}", "", f"<b>{esc(question.prompt)}</b>"]
+    if previous := form.answers.get(question.key):
+        lines.append(f"Сейчас: {esc(previous)}")
+    lines.append("")
+    lines.append("<i>Напишите ответ сообщением" + (" или выберите вариант" if question.options else "") + ".</i>")
+    return "\n".join(lines)
+
+
+def _question_keyboard(form: OfferForm) -> InlineKeyboardMarkup:
+    question = form.current
+    assert question is not None
+    step = form.step
+    options = [InlineKeyboardButton(text, callback_data=f"fo:{step}.{i}") for i, text in enumerate(question.options)]
+    # Короткие варианты — по два в ряд, длинные — по одному
+    rows: list[list[InlineKeyboardButton]] = []
+    for button in options:
+        if rows and len(rows[-1]) == 1 and len(rows[-1][0].text) <= 16 and len(button.text) <= 16:
+            rows[-1].append(button)
+        else:
+            rows.append([button])
+
+    navigation = [InlineKeyboardButton("Пропустить ⏭", callback_data=f"fs:{step}")]
+    if step > 0:
+        navigation.insert(0, InlineKeyboardButton("◀ Назад", callback_data=f"fb:{step}"))
+    rows.append(navigation)
+    rows.append([
+        InlineKeyboardButton("✍ Остальное заполню сам", callback_data=f"ff:{step}"),
+        InlineKeyboardButton("✖ Отмена", callback_data="fx:-"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _start_form(
+    message: Message,
+    context: ContextTypes.DEFAULT_TYPE,
+    kind: OfferKind,
+    numbers: list[str],
+    has_premises: bool,
+) -> None:
+    form = OfferForm(kind=kind, numbers=numbers, has_premises=has_premises)
+    context.chat_data[FORM_KEY] = form
+    _activity(context).action(f"анкета «{_FORM_TITLES[kind]}» · вопросов {len(form.questions)}")
+    await _ask_question(message, context, form)
+
+
+async def _ask_question(message: Message, context: ContextTypes.DEFAULT_TYPE, form: OfferForm) -> None:
+    if form.done:
+        await _finish_form(message, context, form)
+        return
+    sent = await message.reply_text(_question_text(form), reply_markup=_question_keyboard(form))
+    form.message_id = sent.message_id
+
+
+async def _close_question(
+    context: ContextTypes.DEFAULT_TYPE, chat_id: int, form: OfferForm, note: str, question_text: str
+) -> None:
+    """Убирает кнопки с отвеченного вопроса и дописывает, чем он закончился."""
+    if form.message_id is None:
+        return
+    try:
+        await context.bot.edit_message_text(
+            f"{question_text.rsplit(chr(10) * 2, 1)[0]}\n\n{note}",
+            chat_id=chat_id,
+            message_id=form.message_id,
+            reply_markup=None,
+        )
+    except BadRequest as exc:  # сообщение могли удалить — анкета от этого не ломается
+        logger.debug("Не удалось обновить вопрос анкеты: %s", exc)
+
+
+async def _answer_form_text(message: Message, context: ContextTypes.DEFAULT_TYPE, form: OfferForm) -> None:
+    text = (message.text or "").strip()
+    if not text:
+        return
+    question_text = _question_text(form)
+    value = form.answer(text)
+    await _close_question(context, message.chat_id, form, f"✅ {esc(value)}", question_text)
+    await _ask_question(message, context, form)
+
+
+async def _form_callback(query, action: str, payload: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    form: OfferForm | None = context.chat_data.get(FORM_KEY)
+    message = query.message
+
+    if action == "fx":
+        context.chat_data.pop(FORM_KEY, None)
+        _activity(context).action("отменил анкету")
+        await query.answer("Отменено")
+        await _safe_edit(message, "Анкета отменена, предложение не сформировано.")
+        return
+
+    step_text, _, option = payload.partition(".")
+    if form is None or not step_text.isdigit() or int(step_text) != form.step or form.done:
+        await query.answer("Этот вопрос уже не актуален", show_alert=False)
+        return
+
+    await query.answer()
+    question_text = _question_text(form)
+    if action == "fo":
+        question = form.current
+        try:
+            choice = question.options[int(option)]
+        except (ValueError, IndexError):
+            return
+        value = form.answer(choice)
+        note = f"✅ {esc(value)}"
+    elif action == "fs":
+        form.skip()
+        note = "⏭ Пропущено"
+    elif action == "fb":
+        form.back()
+        note = "◀ Вернулись к предыдущему вопросу"
+    elif action == "ff":
+        form.finish_now()
+        note = "✍ Остальные графы останутся пустыми"
+    else:
+        return
+
+    await _close_question(context, message.chat_id, form, note, question_text)
+    await _ask_question(message, context, form)
+
+
+async def _finish_form(message: Message, context: ContextTypes.DEFAULT_TYPE, form: OfferForm) -> None:
+    context.chat_data.pop(FORM_KEY, None)
+    results = await _fetch_many(context, form.numbers)
+    objects = [obj for _, obj, _ in results if obj is not None]
+    if not objects:
+        await message.reply_text("Не удалось получить данные объектов из НСПД — попробуйте ещё раз позже.")
+        return
+
+    if form.kind == "loan":
+        texts = format_pledge_offer(objects, form.answers)
+        title = "займ под залог" if len(objects) == 1 else f"займ под залог, объектов {len(objects)}"
+    else:
+        texts = [format_offer(objects[0], "buyout", form.answers)]
+        title = "срочный выкуп"
+
+    _activity(context).offer(
+        title, [obj.cad_number for obj in objects], f"{form.filled}/{len(form.questions)}"
+    )
+    await message.reply_text("Готово! Текст предложения — ниже, его можно переслать инвесторам.")
+    for text in texts:
         await message.reply_text(text)
 
 
@@ -350,6 +514,11 @@ async def _finish_pledge(message: Message, numbers: list[str], context: ContextT
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     numbers = extract_kad_numbers(message.text or "")
+
+    form = context.chat_data.get(FORM_KEY) if context.chat_data is not None else None
+    if form is not None:
+        await _answer_form_text(message, context, form)
+        return
 
     if context.chat_data is not None and PLEDGE_KEY in context.chat_data:
         await _finish_pledge(message, numbers, context)
@@ -428,6 +597,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     message = query.message
 
+    if action in ("fo", "fs", "fb", "ff", "fx"):
+        await _form_callback(query, action, kad_number, context)
+        return
+
     if action == "card":
         await query.answer()
         await _send_card(message, kad_number, context)
@@ -482,8 +655,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         activity.action(f"связанные объекты · {kad_number} · найдено {len(related)}")
         await message.reply_text(format_related(obj, related), reply_markup=numbers_keyboard(related))
     elif action in ("loan1", "buy"):
-        activity.offer("займ под залог, один объект" if action == "loan1" else "срочный выкуп", kad_number)
-        await message.reply_text(format_offer(obj, "loan" if action == "loan1" else "buyout"))
+        kind: OfferKind = "loan" if action == "loan1" else "buyout"
+        await _start_form(message, context, kind, [obj.cad_number], obj.kind is ObjectKind.PREMISES)
     elif action == "json":
         activity.action(f"скачал JSON · {kad_number}")
         payload = json.dumps(obj.raw, ensure_ascii=False, indent=2).encode("utf-8")

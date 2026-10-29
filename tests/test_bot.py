@@ -29,6 +29,7 @@ from nspdbot.formatting import (
     format_pledge_offer,
 )
 from nspdbot.models import NspdObject, ObjectKind
+from nspdbot.offer_form import LOAN_QUESTIONS, OfferForm, normalize_answer, questions_for
 from nspdbot.nspd_service import NspdNotFound, NspdService, NspdUnavailable
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -235,8 +236,10 @@ class PledgeDialogTests(unittest.TestCase):
         report = status.edit_text.call_args.args[0]
         self.assertIn("объектов 2 из 3", report)
         self.assertIn("77:01:0001001:999999", report)
-        offer = message.reply_text.call_args.args[0]
-        self.assertIn("займ под залог 2 объектов", offer)
+        # Дальше — анкета: первый вопрос, в списке есть квартира, поэтому 8 вопросов
+        form = context.chat_data[handlers.FORM_KEY]
+        self.assertEqual(form.numbers, [land.cad_number, flat.cad_number])
+        self.assertIn("вопрос 1/8", message.reply_text.call_args.args[0])
 
     def test_no_numbers_keeps_waiting(self):
         context = self._context({})
@@ -244,6 +247,81 @@ class PledgeDialogTests(unittest.TestCase):
         message, _ = self._message()
         asyncio.run(handlers._finish_pledge(message, [], context))
         self.assertIn(handlers.PLEDGE_KEY, context.chat_data)
+
+
+class OfferFormTests(unittest.TestCase):
+    def test_questions_depend_on_premises(self):
+        loan = [q.key for q in questions_for("loan", has_premises=False)]
+        self.assertEqual(loan, ["amount", "term", "purpose", "job", "income", "business", "encumbrances"])
+        self.assertEqual(questions_for("loan", has_premises=True)[-1].key, "registered")
+        self.assertEqual([q.key for q in questions_for("buyout", False)], ["price", "deadline", "encumbrances"])
+
+    def test_business_options(self):
+        business = next(q for q in LOAN_QUESTIONS if q.key == "business")
+        self.assertEqual(
+            business.options,
+            ("ИП", "Самозанятость", "ООО", "Откроет при необходимости СЗ", "Откроет при необходимости ИП", "Нет ничего"),
+        )
+
+    def test_money_normalization(self):
+        amount = LOAN_QUESTIONS[0]
+        self.assertEqual(normalize_answer(amount, "5000000"), "5 000 000 руб.")
+        self.assertEqual(normalize_answer(amount, "1 500 000 руб"), "1 500 000 руб.")
+        self.assertEqual(normalize_answer(amount, "5 млн"), "5 млн")
+        self.assertEqual(normalize_answer(LOAN_QUESTIONS[2], "  на   ремонт "), "на ремонт")
+
+    def test_form_navigation(self):
+        form = OfferForm(kind="loan", numbers=["x"], has_premises=False)
+        form.answer("3000000")
+        form.skip()
+        form.back()
+        self.assertEqual(form.current.key, "term")
+        form.answer("12 месяцев")
+        self.assertEqual(form.answers, {"amount": "3 000 000 руб.", "term": "12 месяцев"})
+        form.finish_now()
+        self.assertTrue(form.done)
+        self.assertEqual(form.filled, 2)
+
+    def test_offer_uses_answers(self):
+        flat = load("flat", "77:03:0002007:12000")
+        answers = {"amount": "3 млн руб.", "business": "Самозанятость", "registered": "Нет", "job": "<ООО «Ромашка»>"}
+        text = format_offer(flat, "loan", answers)
+        self.assertIn("• Требуемая сумма: 3 млн руб.", text)
+        self.assertIn("• Наличие ИП / СЗ / ООО: Самозанятость", text)
+        self.assertIn("• Зарегистрированные лица: Нет", text)
+        self.assertIn("&lt;ООО «Ромашка»&gt;", text)
+        self.assertIn("• Срок: ______", text)  # не отвечено — пустая графа
+
+    def test_dialog_with_buttons_and_text(self):
+        flat = load("flat", "77:03:0002007:12000")
+        context = PledgeDialogTests._context(self, {flat.cad_number: flat})
+        context.bot.edit_message_text = mock.AsyncMock()
+        message, _ = PledgeDialogTests._message(self)
+        message.chat_id = 1
+
+        def query(data):
+            q = mock.Mock(data=data, message=message)
+            q.answer = mock.AsyncMock()
+            update = mock.Mock(callback_query=q)
+            return update
+
+        async def run():
+            await handlers._start_form(message, context, "buyout", [flat.cad_number], has_premises=True)
+            form = context.chat_data[handlers.FORM_KEY]
+            message.text = "12000000"
+            await handlers._answer_form_text(message, context, form)               # цена
+            await handlers.callback_handler(query("fo:1.1"), context)              # срок: 2 недели
+            await handlers.callback_handler(query("fo:1.0"), context)              # устаревшая кнопка
+            await handlers.callback_handler(query("fs:2"), context)                # обременения: пропуск
+            await handlers.callback_handler(query("fo:3.0"), context)              # зарег. лица: Нет
+
+        asyncio.run(run())
+        self.assertNotIn(handlers.FORM_KEY, context.chat_data)
+        offer = message.reply_text.call_args.args[0]
+        self.assertIn("• Ожидаемая цена выкупа: 12 000 000 руб.", offer)
+        self.assertIn("• Желаемый срок сделки: 2 недели", offer)
+        self.assertIn("• Обременения: ______", offer)
+        self.assertIn("• Зарегистрированные лица: Нет", offer)
 
 
 def _update(user_id=1, first="Иван", last="Петров", username="ivan", chat_type="private", title=None, text=None):

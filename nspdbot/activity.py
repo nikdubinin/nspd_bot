@@ -150,12 +150,12 @@ class Activity:
             f"{_seconds(seconds)} · отправлен CSV",
         )
 
-    def offer(self, title: str, kad_number: str) -> None:
+    def offer(self, title: str, numbers: list[str], filled: str = "") -> None:
         self.stats["offers"] += 1
-        self.emit("ПРЕДЛОЖ", f"{self.who}: {title} · {kad_number}")
+        note = f" · анкета {filled}" if filled else ""
+        self.emit("ПРЕДЛОЖ", f"{self.who}: {title} · {_numbers(numbers)}{note}")
 
     def pledge(self, numbers: list[str], found: int, seconds: float) -> None:
-        self.stats["offers"] += 1
         self.emit(
             "ЗАЛОГ",
             f"{self.who}: займ под залог · {_numbers(numbers)} · в предложении {found} из {len(numbers)} · "
