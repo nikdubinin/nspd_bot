@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 from logging.handlers import RotatingFileHandler
 
 from telegram import BotCommand, LinkPreviewOptions, Update
@@ -47,7 +48,7 @@ def setup_logging(settings: Settings) -> None:
     )
     file_handler.setFormatter(formatter)
     # В консоли — только читаемый журнал действий и предупреждения, подробности — в файле
-    console_handler = logging.StreamHandler()
+    console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(ConsoleFormatter())
     console_handler.addFilter(ConsoleFilter())
 

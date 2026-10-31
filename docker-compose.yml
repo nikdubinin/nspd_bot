@@ -1,0 +1,20 @@
+services:
+  nspd-bot:
+    build: .
+    image: nspd-bot:latest
+    container_name: nspd-bot
+    # Токен и настройки — из того же .env, что и при запуске через start_bot.bat
+    env_file: .env
+    restart: unless-stopped
+    volumes:
+      # Состояние чатов (режимы, история, анкеты) и подробный журнал остаются на диске
+      # в папке проекта и переживают пересборку контейнера
+      - ./data:/app/data
+      - ./logs:/app/logs
+    # Журнал действий виден во вкладке Logs в Docker Desktop и в «docker compose logs -f».
+    # Ограничиваем размер, чтобы логи Docker не росли бесконечно.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"

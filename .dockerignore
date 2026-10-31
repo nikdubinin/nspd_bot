@@ -1,0 +1,15 @@
+.git
+.gitignore
+.env
+*.env
+venv
+.venv
+__pycache__
+*.py[cod]
+data
+logs
+graphify-out
+*.bat
+*.md
+Dockerfile
+docker-compose.yml
