@@ -14,4 +14,7 @@ data/
 logs/
 *.log
 
+# Граф знаний graphify (локальный, пересобирается командой /graphify)
+graphify-out/
+
 .DS_Store
