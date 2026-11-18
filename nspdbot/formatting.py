@@ -268,9 +268,45 @@ def _additional(answers: Answers, *, has_premises: bool, documents: str) -> list
     ]
 
 
-def _offer_characteristics(obj: NspdObject) -> list[str]:
+def _is_share(obj: NspdObject, answers: Answers) -> bool:
+    return (answers or {}).get(f"asset:{obj.cad_number}:scope") == "Доля"
+
+
+def _share_description(obj: NspdObject, answers: Answers) -> str:
+    """Пользователь описывает залог, а НСПД описывает весь кадастровый объект."""
+    values = answers or {}
+    key = f"asset:{obj.cad_number}"
+    size = esc(values.get(f"{key}:share", "не указан"))
+    noun, _ = obj.noun_phrase()
+    where = {
+        "квартира": "квартире", "комната": "комнате", "помещение": "помещении",
+        "нежилое помещение": "нежилом помещении", "жилой дом": "жилом доме",
+        "многоквартирный дом": "многоквартирном доме", "здание": "здании",
+        "нежилое здание": "нежилом здании", "земельный участок": "земельном участке",
+        "сооружение": "сооружении", "объект незавершённого строительства": "объекте незавершённого строительства",
+        "машино-место": "машино-месте",
+    }.get(noun, "объекте недвижимости")
+    allocated = values.get(f"{key}:allocated")
+    part = "комната" if allocated == "Да, в комнату" else "помещение" if allocated == "Да, в помещение" else None
+    if part:
+        return f"{part} (со слов заявителя; доля {size} в {where})"
+    return f"доля {size} в {where}"
+
+
+def _share_note(obj: NspdObject, answers: Answers) -> list[str]:
+    if not _is_share(obj, answers):
+        return []
+    return ["<i>Размер доли и сведения о комнате/помещении — со слов заявителя; "
+            "НСПД их не подтверждает. Площадь комнаты по размеру доли не рассчитывается.</i>"]
+
+
+def _offer_characteristics(obj: NspdObject, answers: Answers = None) -> list[str]:
+    share = _is_share(obj, answers)
+    area_label = "Площадь всего объекта" if share else "Площадь"
+    cost_label = "Кадастровая стоимость всего объекта" if share else "Кадастровая стоимость"
     characteristics = _compact([
-        f"• Площадь: {esc(_area(obj))}" if obj.area else None,
+        f"• Размер доли: {esc((answers or {}).get(f'asset:{obj.cad_number}:share'))}" if share else None,
+        f"• {area_label}: {esc(_area(obj))}" if obj.area else None,
         f"• Категория земель: {esc(obj.land_category)}" if obj.land_category else None,
         f"• Назначение: {esc(obj.purpose)}" if obj.purpose else None,
         f"• Вид разрешённого использования: {esc(truncate(obj.permitted_use, 300))}" if obj.permitted_use else None,
@@ -279,7 +315,7 @@ def _offer_characteristics(obj: NspdObject) -> list[str]:
         f"• Материал стен: {esc(obj.materials)}" if obj.materials else None,
         f"• Год постройки / ввода: {esc(obj.year_built or obj.year_commissioning)}"
         if (obj.year_built or obj.year_commissioning) else None,
-        f"• Кадастровая стоимость: {esc(_money(obj.cost_value))}" if obj.cost_value is not None else None,
+        f"• {cost_label}: {esc(_money(obj.cost_value))}" if obj.cost_value is not None else None,
     ])
     return characteristics or ["• Характеристики в открытых данных НСПД не заполнены."]
 
@@ -288,12 +324,20 @@ def format_offer(obj: NspdObject, kind: OfferKind, answers: Answers = None) -> s
     noun, located = obj.noun_phrase()
 
     title = "Предложение по займу под залог" if kind == "loan" else "Предложение на срочный выкуп"
+    if kind == "loan" and _is_share(obj, answers):
+        title += " доли"
     lines = [f"<b>{title}</b>", "", "Добрый день, уважаемые коллеги!", ""]
 
     intro = f"Вашему вниманию предлагается {esc(noun)} с кадастровым номером <code>{esc(obj.cad_number)}</code>"
     intro += f", {located} по адресу: {esc(obj.address)}." if obj.address else "."
+    if _is_share(obj, answers):
+        intro = (f"К залогу предлагается {_share_description(obj, answers)}. "
+                 f"Кадастровый номер всего объекта: <code>{esc(obj.cad_number)}</code>.")
+        if obj.address:
+            intro += f" Адрес: {esc(obj.address)}."
     lines += [intro, "", "<b>Характеристики объекта</b>"]
-    lines.extend(_offer_characteristics(obj))
+    lines.extend(_offer_characteristics(obj, answers))
+    lines.extend(_share_note(obj, answers))
 
     if kind == "loan":
         lines += ["", *_loan_terms(answers)]
@@ -326,7 +370,10 @@ def format_pledge_offer(objects: list[NspdObject], answers: Answers = None) -> l
             "",
             "Добрый день, уважаемые коллеги!",
             "",
-            f"Вашему вниманию предлагается займ под залог {len(objects)} объектов недвижимости.",
+            (f"Вашему вниманию предлагается займ под залог объектов недвижимости и/или долей; "
+             f"кадастровых объектов: {len(objects)}."
+             if any(_is_share(obj, answers) for obj in objects)
+             else f"Вашему вниманию предлагается займ под залог {len(objects)} объектов недвижимости."),
         ])
     ]
 
@@ -334,14 +381,21 @@ def format_pledge_offer(objects: list[NspdObject], answers: Answers = None) -> l
         noun, located = obj.noun_phrase()
         head = f"<b>Объект {index}.</b> {esc(noun.capitalize())}, кадастровый номер <code>{esc(obj.cad_number)}</code>"
         head += f", {located} по адресу: {esc(obj.address)}." if obj.address else "."
-        blocks.append("\n".join([head, *_offer_characteristics(obj)]))
+        if _is_share(obj, answers):
+            head = (f"<b>Объект {index}.</b> К залогу предлагается {_share_description(obj, answers)}. "
+                    f"Кадастровый номер всего объекта: <code>{esc(obj.cad_number)}</code>.")
+            if obj.address:
+                head += f" Адрес: {esc(obj.address)}."
+        blocks.append("\n".join([head, *_offer_characteristics(obj, answers), *_share_note(obj, answers)]))
 
     total_cost = sum(obj.cost_value for obj in objects if obj.cost_value is not None)
     has_cost = [obj for obj in objects if obj.cost_value is not None]
     summary = ["<b>Итого по залогу</b>", f"• Количество объектов: {len(objects)}"]
     if has_cost:
         note = "" if len(has_cost) == len(objects) else f" (по {len(has_cost)} из {len(objects)} объектов)"
-        summary.append(f"• Суммарная кадастровая стоимость: {esc(_money(total_cost))}{note}")
+        label = ("Суммарная кадастровая стоимость объектов целиком (не стоимость залога)"
+                 if any(_is_share(obj, answers) for obj in objects) else "Суммарная кадастровая стоимость")
+        summary.append(f"• {label}: {esc(_money(total_cost))}{note}")
     blocks.append("\n".join(summary))
 
     has_premises = any(obj.kind is ObjectKind.PREMISES for obj in objects)

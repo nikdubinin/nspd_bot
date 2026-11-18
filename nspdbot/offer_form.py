@@ -23,6 +23,8 @@ class Question:
     options: tuple[str, ...] = ()  # варианты для кнопок
     money: bool = False  # «5000000» -> «5 000 000 руб.»
     premises_only: bool = False  # только если среди объектов есть помещение
+    required: bool = False
+    fraction: bool = False
 
 
 LOAN_QUESTIONS: tuple[Question, ...] = (
@@ -77,6 +79,16 @@ _MONEY_RE = re.compile(r"^\s*(\d[\d\s]*(?:[.,]\d+)?)\s*(?:р|р\.|руб|руб\
 def normalize_answer(question: Question, text: str) -> str:
     """Чистит ответ; голое число для денежных вопросов оформляет как сумму в рублях."""
     text = " ".join(text.split())[:MAX_ANSWER_LEN]
+    if question.required and question.options:
+        choice = next((option for option in question.options if option.casefold() == text.casefold()), None)
+        if choice is None:
+            raise ValueError("Выберите вариант кнопкой: " + ", ".join(question.options))
+        text = choice
+    if question.fraction:
+        match = re.fullmatch(r"([0-9]{1,9})\s*/\s*([0-9]{1,9})", text)
+        if not match or not 0 < int(match[1]) < int(match[2]):
+            raise ValueError("Введите долю в формате 23/130: числитель и знаменатель — положительные целые числа, числитель меньше знаменателя.")
+        return f"{int(match[1])}/{int(match[2])}"
     if question.money and (match := _MONEY_RE.match(text)):
         digits = match.group(1).replace(" ", "").replace(",", ".")
         try:
@@ -98,10 +110,28 @@ class OfferForm:
     step: int = 0
     answers: dict[str, str] = field(default_factory=dict)
     message_id: int | None = None  # сообщение с текущим вопросом — чтобы убрать с него кнопки
+    collect_assets: bool = False  # старые сохранённые анкеты продолжаются без новых шагов
 
     @property
     def questions(self) -> list[Question]:
-        return questions_for(self.kind, self.has_premises)
+        assets = []
+        if getattr(self, "collect_assets", False):
+            for cad in self.numbers:
+                key = f"asset:{cad}"
+                assets.append(Question(
+                    f"{key}:scope", "Предмет залога",
+                    f"Объект {cad}: к залогу предлагается целый объект или доля?",
+                    options=("Целый объект", "Доля"), required=True,
+                ))
+                if self.answers.get(f"{key}:scope") == "Доля":
+                    assets.extend([
+                        Question(f"{key}:share", "Размер доли",
+                                 f"Объект {cad}: введите размер доли, например 23/130.", required=True, fraction=True),
+                        Question(f"{key}:allocated", "Комната / помещение",
+                                 f"Объект {cad}: закреплена ли за долей конкретная комната/помещение (по вашим сведениям)?",
+                                 options=("Да, в комнату", "Да, в помещение", "Нет"), required=True),
+                    ])
+        return assets + questions_for(self.kind, self.has_premises)
 
     @property
     def current(self) -> Question | None:
@@ -117,11 +147,17 @@ class OfferForm:
         assert question is not None
         value = normalize_answer(question, text)
         self.answers[question.key] = value
+        if question.key.endswith(":scope") and value == "Целый объект":
+            prefix = question.key.removesuffix("scope")
+            self.answers.pop(prefix + "share", None)
+            self.answers.pop(prefix + "allocated", None)
         self.step += 1
         return value
 
     def skip(self) -> None:
         question = self.current
+        if question is not None and question.required:
+            raise ValueError("Сначала уточните предмет залога — этот вопрос нельзя пропустить.")
         if question is not None:
             self.answers.pop(question.key, None)
         self.step += 1
@@ -130,6 +166,8 @@ class OfferForm:
         self.step = max(0, self.step - 1)
 
     def finish_now(self) -> None:
+        if any(q.required for q in self.questions[self.step:]):
+            raise ValueError("Сначала уточните для каждого объекта: целиком или доля, размер доли и комнату/помещение.")
         self.step = len(self.questions)
 
     @property

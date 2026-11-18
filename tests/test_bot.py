@@ -215,7 +215,9 @@ class PledgeDialogTests(unittest.TestCase):
 
     def _message(self):
         message = mock.Mock()
+        message.message_id = 10
         status = mock.Mock()
+        status.message_id = 10
         status.edit_text = mock.AsyncMock()
         message.reply_text = mock.AsyncMock(return_value=status)
         return message, status
@@ -236,10 +238,11 @@ class PledgeDialogTests(unittest.TestCase):
         report = status.edit_text.call_args.args[0]
         self.assertIn("объектов 2 из 3", report)
         self.assertIn("77:01:0001001:999999", report)
-        # Дальше — анкета: первый вопрос, в списке есть квартира, поэтому 8 вопросов
+        # Перед общей анкетой уточняется предмет залога для каждого объекта.
         form = context.chat_data[handlers.FORM_KEY]
         self.assertEqual(form.numbers, [land.cad_number, flat.cad_number])
-        self.assertIn("вопрос 1/8", message.reply_text.call_args.args[0])
+        self.assertIn("целый объект или доля", message.reply_text.call_args.args[0])
+        self.assertIn(land.cad_number, message.reply_text.call_args.args[0])
 
     def test_no_numbers_keeps_waiting(self):
         context = self._context({})

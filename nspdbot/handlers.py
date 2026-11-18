@@ -59,9 +59,11 @@ HELP_TEXT = (
     "• Связанные объекты — здания на участке, участки под зданием, здание для помещения\n"
     "• Займ под залог — бот спросит, один объект в залоге или несколько, задаст вопросы "
     "о займе и заёмщике и соберёт готовый текст для инвесторов\n"
+    "Для каждого объекта займа уточняются: целиком или доля, размер доли (23/130), "
+    "комната/помещение. Площадь и стоимость НСПД относятся ко всему объекту.\n"
     "• Срочный выкуп — бот спросит цену, сроки и обременения и соберёт текст\n"
-    "На любой вопрос можно ответить текстом, выбрать вариант или пропустить — "
-    "тогда в тексте останется пустая графа.\n"
+    "Общие вопросы о займе можно пропустить — тогда в тексте останется пустая графа. "
+    "Уточнения предмета залога обязательны.\n"
     "• Обновить — запросить свежие данные, минуя кэш\n"
     "• JSON — исходный ответ НСПД файлом\n\n"
     "<i>Сведения о правообладателях и обременениях НСПД в открытом доступе не публикует — "
@@ -382,14 +384,18 @@ def _question_keyboard(form: OfferForm) -> InlineKeyboardMarkup:
         else:
             rows.append([button])
 
-    navigation = [InlineKeyboardButton("Пропустить ⏭", callback_data=f"fs:{step}")]
+    navigation = []
+    if not question.required:
+        navigation.append(InlineKeyboardButton("Пропустить ⏭", callback_data=f"fs:{step}"))
     if step > 0:
         navigation.insert(0, InlineKeyboardButton("◀ Назад", callback_data=f"fb:{step}"))
-    rows.append(navigation)
-    rows.append([
-        InlineKeyboardButton("✍ Остальное заполню сам", callback_data=f"ff:{step}"),
-        InlineKeyboardButton("✖ Отмена", callback_data="fx:-"),
-    ])
+    if navigation:
+        rows.append(navigation)
+    finish = []
+    if not any(q.required for q in form.questions[form.step:]):
+        finish.append(InlineKeyboardButton("✍ Остальное заполню сам", callback_data=f"ff:{step}"))
+    finish.append(InlineKeyboardButton("✖ Отмена", callback_data="fx:-"))
+    rows.append(finish)
     return InlineKeyboardMarkup(rows)
 
 
@@ -400,7 +406,7 @@ async def _start_form(
     numbers: list[str],
     has_premises: bool,
 ) -> None:
-    form = OfferForm(kind=kind, numbers=numbers, has_premises=has_premises)
+    form = OfferForm(kind=kind, numbers=numbers, has_premises=has_premises, collect_assets=kind == "loan")
     context.chat_data[FORM_KEY] = form
     _activity(context).action(f"анкета «{_FORM_TITLES[kind]}» · вопросов {len(form.questions)}")
     await _ask_question(message, context, form)
@@ -432,11 +438,18 @@ async def _close_question(
 
 
 async def _answer_form_text(message: Message, context: ContextTypes.DEFAULT_TYPE, form: OfferForm) -> None:
+    if form.done:
+        await _finish_form(message, context, form)
+        return
     text = (message.text or "").strip()
     if not text:
         return
     question_text = _question_text(form)
-    value = form.answer(text)
+    try:
+        value = form.answer(text)
+    except ValueError as exc:
+        await message.reply_text(esc(exc))
+        return
     await _close_question(context, message.chat_id, form, f"✅ {esc(value)}", question_text)
     await _ask_question(message, context, form)
 
@@ -444,6 +457,10 @@ async def _answer_form_text(message: Message, context: ContextTypes.DEFAULT_TYPE
 async def _form_callback(query, action: str, payload: str, context: ContextTypes.DEFAULT_TYPE) -> None:
     form: OfferForm | None = context.chat_data.get(FORM_KEY)
     message = query.message
+
+    if form is None or message.message_id != form.message_id:
+        await query.answer("Этот вопрос уже не актуален", show_alert=False)
+        return
 
     if action == "fx":
         context.chat_data.pop(FORM_KEY, None)
@@ -458,22 +475,36 @@ async def _form_callback(query, action: str, payload: str, context: ContextTypes
         return
 
     await query.answer()
+    # Пока Telegram подтверждает нажатие, другой update мог уже ответить на вопрос.
+    if (context.chat_data.get(FORM_KEY) is not form
+            or form.message_id != message.message_id
+            or form.step != int(step_text) or form.done):
+        return
     question_text = _question_text(form)
     if action == "fo":
         question = form.current
         try:
-            choice = question.options[int(option)]
+            index = int(option)
+            if index < 0:
+                return
+            choice = question.options[index]
         except (ValueError, IndexError):
             return
         value = form.answer(choice)
         note = f"✅ {esc(value)}"
     elif action == "fs":
+        if form.current.required:
+            await message.reply_text("Уточните предмет залога — этот вопрос нельзя пропустить.")
+            return
         form.skip()
         note = "⏭ Пропущено"
     elif action == "fb":
         form.back()
         note = "◀ Вернулись к предыдущему вопросу"
     elif action == "ff":
+        if any(q.required for q in form.questions[form.step:]):
+            await message.reply_text("Сначала уточните предмет залога для каждого объекта.")
+            return
         form.finish_now()
         note = "✍ Остальные графы останутся пустыми"
     else:
@@ -484,12 +515,18 @@ async def _form_callback(query, action: str, payload: str, context: ContextTypes
 
 
 async def _finish_form(message: Message, context: ContextTypes.DEFAULT_TYPE, form: OfferForm) -> None:
-    context.chat_data.pop(FORM_KEY, None)
     results = await _fetch_many(context, form.numbers)
     objects = [obj for _, obj, _ in results if obj is not None]
-    if not objects:
-        await message.reply_text("Не удалось получить данные объектов из НСПД — попробуйте ещё раз позже.")
+    failed = [(cad, error) for cad, obj, error in results if obj is None]
+    if failed:
+        await message.reply_text(
+            "Не удалось получить все объекты из НСПД. Анкета сохранена; "
+            "напишите «Повторить» для повторной попытки или /cancel.\n"
+            + "\n".join(f"• <code>{esc(cad)}</code> — {esc(error)}" for cad, error in failed)
+        )
         return
+
+    context.chat_data.pop(FORM_KEY, None)
 
     if form.kind == "loan":
         texts = format_pledge_offer(objects, form.answers)
